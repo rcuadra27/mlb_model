@@ -186,10 +186,3 @@ The project uses PostgreSQL with tables including:
 - The system supports filtering by sportsbook for odds comparison
 - Feature engineering handles missing data with appropriate defaults
 
-## License
-
-[Add your license here]
-
-## Author
-
-[Add your name/contact info here]
