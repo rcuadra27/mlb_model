@@ -193,4 +193,3 @@ The project uses PostgreSQL with tables including:
 ## Author
 
 [Add your name/contact info here]
-
