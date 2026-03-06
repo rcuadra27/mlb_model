@@ -1,0 +1,39 @@
+{
+  "best_iteration": 37,
+  "train": {
+    "split": "train",
+    "n": 17904,
+    "log_loss": 0.6581229666155514,
+    "brier": 0.23271746136610302,
+    "auc": 0.6856585367260601,
+    "mean_p_homewin": 0.5350515966150329,
+    "mean_y": 0.5350759606791778
+  },
+  "val": {
+    "split": "val",
+    "n": 2430,
+    "log_loss": 0.6840074563761767,
+    "brier": 0.24546569653172517,
+    "auc": 0.5754486897607531,
+    "mean_p_homewin": 0.5343089859086213,
+    "mean_y": 0.5209876543209877
+  },
+  "test": {
+    "split": "test",
+    "n": 2429,
+    "log_loss": 0.684046845667852,
+    "brier": 0.2454938175708984,
+    "auc": 0.5757895716364161,
+    "mean_p_homewin": 0.5345860052810061,
+    "mean_y": 0.521613832853026
+  },
+  "n_features": 38,
+  "features_table": "public.features_game",
+  "games_table": "public.games",
+  "date_col": "game_date",
+  "splits": {
+    "train_end": "2022-12-31",
+    "val_end": "2023-12-31",
+    "test_end": "2024-12-31"
+  }
+}

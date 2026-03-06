@@ -1,0 +1,17 @@
+season
+team_id
+opp_id
+team_win_pct_30
+team_runs_for_30
+team_runs_against_30
+team_avg_runs_scored_60
+team_avg_runs_allowed_60
+team_games_in_window_60
+opp_runs
+opp_win_pct_30
+opp_runs_for_30
+opp_runs_against_30
+opp_avg_runs_scored_60
+opp_avg_runs_allowed_60
+opp_games_in_window_60
+is_home

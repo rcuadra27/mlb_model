@@ -1,0 +1,86 @@
+{
+  "splits": {
+    "train_end": "2022-12-31",
+    "val_end": "2023-12-31",
+    "test_end": "2024-12-31"
+  },
+  "home_runs_train": {
+    "target": "home_runs",
+    "mae": 2.3637021028005254,
+    "rmse": 3.033068139817573,
+    "mean_true": 4.566912421805183,
+    "mean_pred": 4.553919535473286
+  },
+  "away_runs_train": {
+    "target": "away_runs",
+    "mae": 2.3928403476851985,
+    "rmse": 3.0473616971089843,
+    "mean_true": 4.43895218945487,
+    "mean_pred": 4.424857233143013
+  },
+  "home_runs_val": {
+    "target": "home_runs",
+    "mae": 2.476489673212133,
+    "rmse": 3.133716294531586,
+    "mean_true": 4.5962962962962965,
+    "mean_pred": 4.617558431088553
+  },
+  "away_runs_val": {
+    "target": "away_runs",
+    "mae": 2.512934019920391,
+    "rmse": 3.2330300784299286,
+    "mean_true": 4.634979423868312,
+    "mean_pred": 4.48648807169831
+  },
+  "home_runs_test": {
+    "target": "home_runs",
+    "mae": 2.3651030238636106,
+    "rmse": 2.990552477325678,
+    "mean_true": 4.376286537669823,
+    "mean_pred": 4.497444294959661
+  },
+  "away_runs_test": {
+    "target": "away_runs",
+    "mae": 2.457427989275802,
+    "rmse": 3.113700017725462,
+    "mean_true": 4.410456978180322,
+    "mean_pred": 4.372502247627781
+  },
+  "n_features": 34,
+  "features": [
+    "home_win_pct_30",
+    "away_win_pct_30",
+    "home_runs_for_30",
+    "home_runs_against_30",
+    "away_runs_for_30",
+    "away_runs_against_30",
+    "home_sp_ra9_last5",
+    "away_sp_ra9_last5",
+    "home_sp_ip_per_start_last5",
+    "away_sp_ip_per_start_last5",
+    "home_bp_outs_1d",
+    "away_bp_outs_1d",
+    "home_bp_outs_3d",
+    "away_bp_outs_3d",
+    "home_bp_outs_5d",
+    "away_bp_outs_5d",
+    "home_avg_runs_scored_60",
+    "home_avg_runs_allowed_60",
+    "away_avg_runs_scored_60",
+    "away_avg_runs_allowed_60",
+    "home_games_in_window_60",
+    "away_games_in_window_60",
+    "home_bp_hlev_outs_1d",
+    "home_bp_hlev_outs_3d",
+    "home_bp_hlev_outs_5d",
+    "away_bp_hlev_outs_1d",
+    "away_bp_hlev_outs_3d",
+    "away_bp_hlev_outs_5d",
+    "home_lineup_skill",
+    "away_lineup_skill",
+    "home_vs_away_sp_matchup",
+    "away_vs_home_sp_matchup",
+    "lineup_skill_diff",
+    "matchup_diff"
+  ]
+}

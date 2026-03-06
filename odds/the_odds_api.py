@@ -22,7 +22,7 @@ class TheOddsAPI:
 
     def get_moneylines(
         self,
-        date_iso: Optional[str] = None,   # some providers support; if not, ignore upstream
+        date_iso: Optional[str] = None,   # ISO datetime string (e.g., "2020-06-06T17:00:00Z")
         regions: str = "us",
         markets: str = "h2h",
         odds_format: str = "american",
@@ -35,7 +35,7 @@ class TheOddsAPI:
             "markets": markets,
             "oddsFormat": odds_format,
         }
-        # Not all plans support a date filter; harmless if ignored by provider
+        # For historical odds, pass the ISO datetime string
         if date_iso:
             params["dateFormat"] = "iso"
             params["commenceTimeFrom"] = date_iso
