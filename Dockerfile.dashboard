@@ -1,0 +1,5 @@
+FROM node:18-slim
+WORKDIR /app
+COPY dashboard/dist .
+RUN npm install -g serve
+CMD ["serve", "-s", ".", "-l", "8080"]

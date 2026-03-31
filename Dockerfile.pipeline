@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    libgomp1 \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Root scripts
+COPY export_to_bigquery.py .
+
+# All pipeline folders
+COPY ingest/ ingest/
+COPY features/ features/
+COPY inference/ inference/
+COPY calibration/ calibration/
+
+# Model artifacts
+COPY artifacts/runs_model_v8.txt /app/artifacts/runs_model_v8.txt
+COPY artifacts/runs_model_v8_features.txt /app/artifacts/runs_model_v8_features.txt
+
+COPY run_daily.sh .
+RUN chmod +x run_daily.sh
+CMD ["bash", "run_daily.sh", "build_features"]

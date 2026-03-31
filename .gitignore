@@ -34,3 +34,25 @@ Thumbs.db
 # Logs
 *.log
 
+
+# Database backups
+*.dump
+*.sql
+
+# Cloud SQL proxy binary
+cloud-sql-proxy
+
+# Conda environment
+mlb_model_env.yml
+
+# Model artifacts (large files)
+artifacts/*.txt
+artifacts/*.joblib
+
+# Dashboard build output
+dashboard/dist/
+dashboard/node_modules/
+
+# GCP credentials
+*.json
+service_account*.json

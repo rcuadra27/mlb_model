@@ -1,746 +1,924 @@
 #!/usr/bin/env python3
 """
-Run inference for a given MLB date and save results to Postgres.
+inference_runs_model.py
 
-Outputs:
-- Predicted runs: home_runs_pred, away_runs_pred
-- Poisson win prob: p_home_win_poisson
-- Market (median across books, vig-free): p_home_market_median, n_books
-- Edge + EV (computed using consensus fair odds derived from p_home_market_median)
+Runs the trained LightGBM runs model for a given date. Fetches moneyline
+AND totals odds from The Odds API in a single call, applies isotonic
+calibration, derives win probabilities and O/U predictions, then prints
+two dashboards:
 
-Saves to:
-  public.inference_game_predictions
+  1. All games  — expected runs per team, win probabilities, O/U prediction
+  2. Value bets — ML and O/U edges that exceed configurable thresholds
 
 Usage:
-  export PG_DSN="postgresql+psycopg2://USER:PASS@HOST:5432/mlb_model"
+    PG_DSN=... ODDS_API_KEY=... python inference_runs_model.py \\
+        --date 2025-04-01 \\
+        --team_model artifacts/runs_model_v2.joblib \\
+        --team_features artifacts/runs_model_v2_features.txt \\
+        --calibrator artifacts/calibrator_isotonic.joblib
 
-  python inference/run_inference_for_date.py \
-    --date 2024-07-01 \
-    --min_books 6 \
-    --top_k 10 \
-    --home_model artifacts/runs_model_home_lgbm_optionA.joblib \
-    --away_model artifacts/runs_model_away_lgbm_optionA.joblib
+    # Skip calibration:
+        --no_calibrate
+
+    # Custom thresholds:
+        --ml_edge_threshold 0.05 --ou_edge_threshold 0.05 --min_run_diff 0.8
 """
 
 import os
-import math
 import argparse
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+import requests
 
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
 from sqlalchemy import create_engine, text
+from scipy.stats import skellam, poisson
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from calibration.calibration import BetaCalibrator, PlattCalibrator
+
+# ---------------------------------------------------------------------------
+# Constants — must match training script exactly
+# ---------------------------------------------------------------------------
+
+WEATHER_FEATURES = [
+    "temp_f", "wind_mph", "wind_dir_sin", "wind_dir_cos",
+    "humidity", "precip_in",
+]
+
+NAN_PASSTHROUGH_FEATURES = WEATHER_FEATURES + [
+    "sp_ra9_diff", "sp_ip_diff",
+    "sp_era_last3_diff", "sp_k9_last5_diff", "sp_days_rest_diff",
+    "sp_xwoba_against_diff", "sp_k_rate_diff", "sp_bb_rate_diff",
+    "sp_gb_rate_diff", "sp_n_pa_diff",
+    "lineup_xwoba_diff", "lineup_k_rate_diff", "lineup_bb_rate_diff",
+    "lineup_n_pa_diff", "lineup_vs_sp_score_diff",
+    "lineup_barrel_rate_diff", "lineup_hard_hit_rate_diff",
+    "runs_for_7d_diff", "runs_for_15d_diff",
+    "runs_against_7d_diff", "runs_against_15d_diff",
+    "win_pct_7d_diff", "win_pct_15d_diff",
+    "total_offense_env", "total_defense_env",
+    "park_runs_factor_blended",
+    "league_avg_runs_60d"
+]
+DROP_SUBSTRINGS = [
+    "price", "_pred", "p_home", "p_away", "p_tie",
+    "p_home_win", "p_home_median", "p_home_blend", "n_books",
+]
+
+GAME_LEVEL_DIFF_COLS = [
+    # existing
+    "sp_ra9_diff", "sp_ip_diff",
+    "bp_outs_3d_diff", "bp_hlev_3d_diff", "bp_b2b_diff",
+    "win_pct_diff", "runs_for_diff", "runs_against_diff",
+    "avg_runs_scored_60_diff", "avg_runs_allowed_60_diff",
+    "matchup_diff",
+    "sp_xwoba_against_diff", "sp_k_rate_diff", "sp_bb_rate_diff",
+    "sp_gb_rate_diff", "sp_n_pa_diff",
+    "lineup_xwoba_diff", "lineup_k_rate_diff", "lineup_bb_rate_diff",
+    "lineup_n_pa_diff", "lineup_vs_sp_score_diff",
+    # NEW — must match train_runs_model.py exactly
+    "runs_for_7d_diff", "runs_for_15d_diff",
+    "runs_against_7d_diff", "runs_against_15d_diff",
+    "win_pct_7d_diff", "win_pct_15d_diff",
+    "sp_era_last3_diff", "sp_k9_last5_diff", "sp_days_rest_diff",
+    "lineup_barrel_rate_diff", "lineup_hard_hit_rate_diff",
+]
+ODDS_API_SPORT = "baseball_mlb"
+
+# Added to clipped model outputs (inference only). Fitted on 2024 held-out data (n=2374 games).
+BIAS_CORRECTION_HOME = 0.0
+BIAS_CORRECTION_AWAY = 0.0
+TRAINING_LEAGUE_MEAN = 4.50
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Odds helpers
-# -----------------------------
+# ---------------------------------------------------------------------------
+
 def american_to_implied(odds: np.ndarray) -> np.ndarray:
-    """American odds -> implied probability (includes vig)."""
     o = odds.astype(float)
     p = np.full_like(o, np.nan, dtype=float)
-    neg = o < 0
-    pos = o > 0
+    neg, pos = o < 0, o > 0
     p[neg] = (-o[neg]) / ((-o[neg]) + 100.0)
     p[pos] = 100.0 / (o[pos] + 100.0)
     return p
 
 
 def prob_to_american(p: np.ndarray) -> np.ndarray:
-    """Probability -> American odds (vig-free synthetic)."""
     p = np.clip(p.astype(float), 1e-6, 1 - 1e-6)
     odds = np.empty_like(p)
     fav = p >= 0.5
-    odds[fav] = -100.0 * (p[fav] / (1.0 - p[fav]))
+    odds[fav]  = -100.0 * (p[fav] / (1.0 - p[fav]))
     odds[~fav] = 100.0 * ((1.0 - p[~fav]) / p[~fav])
     return np.rint(odds).astype(int)
 
 
 def profit_if_win_1u(odds: float) -> float:
-    """Return profit on a 1-unit stake if bet wins, given American odds."""
-    if odds is None or (isinstance(odds, float) and np.isnan(odds)) or odds == 0:
+    if pd.isna(odds) or odds == 0:
         return np.nan
-    if odds > 0:
-        return float(odds) / 100.0
-    return 100.0 / abs(float(odds))
+    return odds / 100.0 if odds > 0 else 100.0 / abs(odds)
 
 
-# -----------------------------
-# Poisson win probability
-# -----------------------------
-def normal_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+def implied_from_american(price) -> float:
+    if pd.isna(price):
+        return np.nan
+    return float(american_to_implied(np.array([float(price)]))[0])
 
 
-def p_home_win_from_lambdas(lambda_home: float, lambda_away: float) -> float:
-    """
-    P(Home wins) when runs are independent Poisson(lambda_home), Poisson(lambda_away).
-    Prefer Skellam (SciPy) if available; fallback to Normal approx on difference.
+# ---------------------------------------------------------------------------
+# Win probability — Skellam conditioned on no tie
+# ---------------------------------------------------------------------------
 
-    Normal approx:
-      D = H - A ~ Normal(mu=lambda_h-lambda_a, var=lambda_h+lambda_a)
-      P(H>A) = P(D >= 1) approx P(D > 0.5) with continuity correction
-    """
-    lh = max(1e-9, float(lambda_home))
-    la = max(1e-9, float(lambda_away))
-
-    # Try SciPy Skellam if installed
-    try:
-        from scipy.stats import skellam  # type: ignore
-        # P(H > A) = 1 - P(H-A <= 0) = 1 - CDF(0)
-        return float(1.0 - skellam.cdf(0, lh, la))
-    except Exception:
-        mu = lh - la
-        var = lh + la
-        sd = math.sqrt(max(1e-12, var))
-        z = (0.5 - mu) / sd
-        return float(1.0 - normal_cdf(z))
+def p_home_win_from_lambdas(lh: float, la: float) -> float:
+    lh = max(1e-9, float(lh))
+    la = max(1e-9, float(la))
+    p_hw   = float(1.0 - skellam.cdf(0, lh, la))
+    p_tie  = float(skellam.pmf(0, lh, la))
+    return p_hw / max(1.0 - p_tie, 1e-9)
 
 
-# -----------------------------
-# Team-model inference (two rows per game)
-# -----------------------------
-def drop_leaky_feature_cols(cols):
-    bad_substrings = ["price", "_pred", "p_home", "p_away", "p_tie", "p_"]
-    out = []
-    for c in cols:
-        lc = c.lower()
-        if any(s in lc for s in bad_substrings):
-            continue
-        out.append(c)
+# ---------------------------------------------------------------------------
+# O/U probability — Poisson total
+# ---------------------------------------------------------------------------
+
+def p_over_under(lh: float, la: float, ou_line: float):
+    """Returns (p_over, p_under, p_push). Total ~ Poisson(lh + la)."""
+    mu    = max(1e-9, float(lh) + float(la))
+    line  = float(ou_line)
+    floor = int(line)
+    p_le_floor = float(poisson.cdf(floor, mu))
+
+    if line == float(floor):
+        p_push  = float(poisson.pmf(floor, mu))
+        p_under = p_le_floor - p_push
+        p_over  = 1.0 - p_le_floor
+    else:
+        p_push  = 0.0
+        p_under = p_le_floor
+        p_over  = 1.0 - p_le_floor
+
+    return p_over, p_under, p_push
+
+
+# ---------------------------------------------------------------------------
+# Feature engineering
+# ---------------------------------------------------------------------------
+
+def drop_leaky(cols):
+    return [c for c in cols if not any(s in c.lower() for s in DROP_SUBSTRINGS)]
+
+
+def add_game_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    def add_diff(new_col, hc, ac):
+        if hc in out.columns and ac in out.columns:
+            out[new_col] = out[hc].astype(float) - out[ac].astype(float)
+
+    # 1. Legacy team strength diffs
+    add_diff("sp_ra9_diff",              "home_sp_ra9_last5",          "away_sp_ra9_last5")
+    add_diff("sp_ip_diff",               "home_sp_ip_per_start_last5", "away_sp_ip_per_start_last5")
+    add_diff("bp_outs_3d_diff",          "home_bp_outs_3d",            "away_bp_outs_3d")
+    add_diff("bp_hlev_3d_diff",          "home_bp_hlev_outs_3d",       "away_bp_hlev_outs_3d")
+    add_diff("win_pct_diff",             "home_win_pct_30",             "away_win_pct_30")
+    add_diff("runs_for_diff",            "home_runs_for_30",            "away_runs_for_30")
+    add_diff("runs_against_diff",        "home_runs_against_30",        "away_runs_against_30")
+    add_diff("avg_runs_scored_60_diff",  "home_avg_runs_scored_60",     "away_avg_runs_scored_60")
+    add_diff("avg_runs_allowed_60_diff", "home_avg_runs_allowed_60",    "away_avg_runs_allowed_60")
+
+    # Short-window team stats
+    add_diff("runs_for_7d_diff",      "home_runs_for_7d",      "away_runs_for_7d")
+    add_diff("runs_for_15d_diff",     "home_runs_for_15d",     "away_runs_for_15d")
+    add_diff("runs_against_7d_diff",  "home_runs_against_7d",  "away_runs_against_7d")
+    add_diff("runs_against_15d_diff", "home_runs_against_15d", "away_runs_against_15d")
+    add_diff("win_pct_7d_diff",       "home_win_pct_7d",       "away_win_pct_7d")
+    add_diff("win_pct_15d_diff",      "home_win_pct_15d",      "away_win_pct_15d")
+    # SP recent form
+    add_diff("sp_era_last3_diff",     "home_sp_era_last3",     "away_sp_era_last3")
+    add_diff("sp_k9_last5_diff",      "home_sp_k9_last5",      "away_sp_k9_last5")
+    add_diff("sp_days_rest_diff",     "home_sp_days_rest",     "away_sp_days_rest")
+    # Lineup power
+    add_diff("lineup_barrel_rate_diff",   "home_lineup_barrel_rate_90",   "away_lineup_barrel_rate_90")
+    add_diff("lineup_hard_hit_rate_diff", "home_lineup_hard_hit_rate_90", "away_lineup_hard_hit_rate_90")
+    # Scoring environment — global features, NOT diffs, pass through as-is
+    # total_offense_env and total_defense_env require no add_diff
+    for h, a in [
+        ("home_bp_b2b_pitchers_3d", "away_bp_b2b_pitchers_3d"),
+        ("home_bp_b2b",             "away_bp_b2b"),
+        ("home_bp_b2b_3d",          "away_bp_b2b_3d"),
+    ]:
+        if h in out.columns and a in out.columns:
+            out["bp_b2b_diff"] = out[h].astype(float) - out[a].astype(float)
+            break
+
+    if "bp_b2b_diff" in out.columns:
+        out["bp_b2b_diff"] = out["bp_b2b_diff"].fillna(0.0)
+
+    add_diff("sp_xwoba_against_diff",  "home_sp_xwoba_against_90",  "away_sp_xwoba_against_90")
+    add_diff("sp_k_rate_diff",         "home_sp_k_rate_90",         "away_sp_k_rate_90")
+    add_diff("sp_bb_rate_diff",        "home_sp_bb_rate_90",        "away_sp_bb_rate_90")
+    add_diff("sp_gb_rate_diff",        "home_sp_gb_rate_90",        "away_sp_gb_rate_90")
+    add_diff("sp_n_pa_diff",           "home_sp_n_pa_90",           "away_sp_n_pa_90")
+    add_diff("lineup_xwoba_diff",      "home_lineup_xwoba_90",      "away_lineup_xwoba_90")
+    add_diff("lineup_k_rate_diff",     "home_lineup_k_rate_90",     "away_lineup_k_rate_90")
+    add_diff("lineup_bb_rate_diff",    "home_lineup_bb_rate_90",    "away_lineup_bb_rate_90")
+    add_diff("lineup_n_pa_diff",       "home_lineup_n_pa_90",       "away_lineup_n_pa_90")
+    add_diff("lineup_vs_sp_score_diff","home_lineup_vs_sp_score",   "away_lineup_vs_sp_score")
+
+    if "wind_dir_deg" in out.columns:
+        wd = out["wind_dir_deg"].astype(float)
+        out["wind_dir_sin"] = np.sin(np.deg2rad(wd))
+        out["wind_dir_cos"] = np.cos(np.deg2rad(wd))
+
     return out
 
 
-def _uniq(seq):
-    """Return list of unique elements preserving order."""
-    out = []
-    seen = set()
-    for x in seq:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
+def add_missingness_flags(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in ["lineup_skill_diff", "matchup_diff"]:
+        flag = f"{col}_known"
+        out[flag] = out[col].notna().astype(float) if col in out.columns else 0.0
     return out
 
 
-def build_inference_team_rows(df_game: pd.DataFrame, feature_cols: list,
-                              home_prefix: str = "home_", away_prefix: str = "away_") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      keys_df: columns [game_id, is_home, team_id, opp_id] aligned with X rows
-      X: model feature matrix with columns == feature_cols
-    """
-    cols = df_game.columns.tolist()
+def add_team_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-    home_cols = [c for c in cols if c.startswith(home_prefix)]
-    away_cols = [c for c in cols if c.startswith(away_prefix)]
-    global_cols = [c for c in cols if (not c.startswith(home_prefix)) and (not c.startswith(away_prefix))]
+    def first(candidates):
+        return next((c for c in candidates if c in out.columns), None)
 
-    # Keep only useful globals (don't duplicate base keys; game_date not used in model)
-    base_keys = ["game_id", "season", "home_team_id", "away_team_id"]
-    global_keep = []
-    for c in global_cols:
-        if c in ["game_id", "season", "game_date"]:
-            continue
-        if c in ["home_team", "away_team"]:
-            continue
-        global_keep.append(c)
+    def add_if_missing(new_col, tc, oc):
+        if new_col in out.columns:
+            return
+        t, o = first(tc), first(oc)
+        if t and o:
+            out[new_col] = out[t].astype(float) - out[o].astype(float)
 
-    # Safety: remove leaky cols
-    home_cols = drop_leaky_feature_cols(home_cols)
-    away_cols = drop_leaky_feature_cols(away_cols)
-    global_keep = drop_leaky_feature_cols(global_keep)
-
-    home_select = _uniq(base_keys + global_keep + home_cols + away_cols)
-    away_select = _uniq(base_keys + global_keep + home_cols + away_cols)
-
-    # HOME ROWS
-    home = df_game[home_select].copy()
-    home = home.rename(columns={"home_team_id": "team_id", "away_team_id": "opp_id"})
-    home["is_home"] = 1
-    home = home.rename(columns={c: "team_" + c[len(home_prefix):] for c in home_cols})
-    home = home.rename(columns={c: "opp_" + c[len(away_prefix):] for c in away_cols})
-
-    # AWAY ROWS
-    away = df_game[away_select].copy()
-    away = away.rename(columns={"away_team_id": "team_id", "home_team_id": "opp_id"})
-    away["is_home"] = 0
-    away = away.rename(columns={c: "team_" + c[len(away_prefix):] for c in away_cols})
-    away = away.rename(columns={c: "opp_" + c[len(home_prefix):] for c in home_cols})
-
-    # Defensive dedupe before concat
-    home = home.loc[:, ~home.columns.duplicated()].copy()
-    away = away.loc[:, ~away.columns.duplicated()].copy()
-
-    team_rows = pd.concat([home, away], ignore_index=True)
-    team_rows = team_rows.loc[:, ~team_rows.columns.duplicated()].copy()
-
-    # Keys aligned with row order
-    keys = team_rows[["game_id", "is_home", "team_id", "opp_id"]].copy()
-
-    # Ensure all required feature columns exist
-    for c in feature_cols:
-        if c not in team_rows.columns:
-            team_rows[c] = np.nan
-
-    X = team_rows[feature_cols].copy()
-
-    # Categoricals
-    for c in ["team_id", "opp_id", "season", "is_home"]:
-        if c in X.columns:
-            X[c] = X[c].astype("category")
-
-    return keys, X
+    add_if_missing("lineup_skill_diff", ["team_lineup_skill"], ["opp_lineup_skill"])
+    add_if_missing("matchup_diff",      ["team_matchup"],      ["opp_matchup"])
+    return out
 
 
-def predict_game_runs_from_team_model(df_game: pd.DataFrame, team_model, feature_cols: list) -> pd.DataFrame:
-    """
-    Bulletproof: build HOME rows and AWAY rows separately and predict each.
-    This removes any possibility of ordering / concat / merge bugs.
-    """
-    cols = df_game.columns.tolist()
-    home_cols = [c for c in cols if c.startswith("home_")]
-    away_cols = [c for c in cols if c.startswith("away_")]
-    global_cols = [c for c in cols if (not c.startswith("home_")) and (not c.startswith("away_"))]
+def build_team_rows(df_game: pd.DataFrame, feature_cols: list):
+    base_cols   = ["game_id", "season"]
+    global_cols = drop_leaky([
+        c for c in df_game.columns
+        if not c.startswith("home_") and not c.startswith("away_")
+        and c not in ["game_date","home_team","away_team","home_team_id","away_team_id"]
+    ])
+    home_cols = drop_leaky([c for c in df_game.columns if c.startswith("home_")])
+    away_cols = drop_leaky([c for c in df_game.columns if c.startswith("away_")])
+    all_cols  = base_cols + global_cols + home_cols + away_cols
 
-    # Keep only useful globals (exclude names/date; keep season/game_id)
-    global_keep = []
-    for c in global_cols:
-        if c in ["game_id", "season"]:
-            global_keep.append(c)
-        elif c in ["game_date", "home_team", "away_team"]:
-            continue
-        else:
-            global_keep.append(c)
+    def make_row(df, team_col, opp_col, target_home, team_rename, opp_rename, is_home_val):
+        frame = df[all_cols].copy()
+        frame["team_id"] = df[team_col].values
+        frame["opp_id"]  = df[opp_col].values
+        frame["is_home"] = is_home_val
+        frame = frame.rename(columns={c: "team_" + c[5:] for c in team_rename})
+        frame = frame.rename(columns={c: "opp_"  + c[5:] for c in opp_rename})
+        frame = frame.loc[:, ~frame.columns.duplicated()].copy()
+        frame = add_team_level_diff_features(frame)
+        return frame
 
-    # Safety: remove leakage
-    home_cols = drop_leaky_feature_cols(home_cols)
-    away_cols = drop_leaky_feature_cols(away_cols)
-    global_keep = drop_leaky_feature_cols(global_keep)
+    H = make_row(df_game, "home_team_id", "away_team_id", True,  home_cols, away_cols, 1)
+    A = make_row(df_game, "away_team_id", "home_team_id", False, away_cols, home_cols, 0)
 
-    def uniq(seq):
-        out = []
-        seen = set()
-        for x in seq:
-            if x not in seen:
-                out.append(x)
-                seen.add(x)
-        return out
+    for col in GAME_LEVEL_DIFF_COLS:
+        if col in A.columns:
+            A[col] = pd.to_numeric(A[col], errors='coerce').multiply(-1)
 
-    base_keys = ["game_id", "season", "home_team_id", "away_team_id"]
+    H = add_missingness_flags(H)
+    A = add_missingness_flags(A)
 
-    # -------------------
-    # HOME feature rows (team = home, opp = away)
-    # -------------------
-    home_select = uniq(base_keys + global_keep + home_cols + away_cols)
-    H = df_game[home_select].copy()
-    H = H.rename(columns={"home_team_id": "team_id", "away_team_id": "opp_id"})
-    H["is_home"] = 1
-    H = H.rename(columns={c: "team_" + c[len("home_"):] for c in home_cols})
-    H = H.rename(columns={c: "opp_" + c[len("away_"):] for c in away_cols})
-    H = H.loc[:, ~H.columns.duplicated()].copy()
+    for frame in [H, A]:
+        for c in feature_cols:
+            if c not in frame.columns:
+                frame[c] = np.nan
 
-    # Ensure all required feature columns exist
-    for c in feature_cols:
-        if c not in H.columns:
-            H[c] = np.nan
     XH = H[feature_cols].copy()
-    for c in ["team_id", "opp_id", "season", "is_home"]:
-        if c in XH.columns:
-            XH[c] = XH[c].astype("category")
-
-    home_pred = team_model.predict(XH).astype(float)
-
-    # -------------------
-    # AWAY feature rows (team = away, opp = home)
-    # -------------------
-    away_select = uniq(base_keys + global_keep + home_cols + away_cols)
-    A = df_game[away_select].copy()
-    A = A.rename(columns={"away_team_id": "team_id", "home_team_id": "opp_id"})
-    A["is_home"] = 0
-    A = A.rename(columns={c: "team_" + c[len("away_"):] for c in away_cols})
-    A = A.rename(columns={c: "opp_" + c[len("home_"):] for c in home_cols})
-    A = A.loc[:, ~A.columns.duplicated()].copy()
-
-    for c in feature_cols:
-        if c not in A.columns:
-            A[c] = np.nan
     XA = A[feature_cols].copy()
-    for c in ["team_id", "opp_id", "season", "is_home"]:
-        if c in XA.columns:
-            XA[c] = XA[c].astype("category")
 
-    away_pred = team_model.predict(XA).astype(float)
+    for X in [XH, XA]:
+        for c in ["team_id", "opp_id", "season"]:
+            if c in X.columns:
+                X[c] = X[c].astype("category")
 
-    # -------------------
-    out = df_game.copy()
-    out["home_runs_pred"] = home_pred
-    out["away_runs_pred"] = away_pred
-    out["total_runs_pred"] = out["home_runs_pred"] + out["away_runs_pred"]
-    out["run_diff_pred"] = out["home_runs_pred"] - out["away_runs_pred"]
+    return XH, XA
 
-    # Extra sanity (should be 0)
-    bad_home = (H["team_id"].astype(int).values != df_game["home_team_id"].astype(int).values).sum()
-    bad_away = (A["team_id"].astype(int).values != df_game["away_team_id"].astype(int).values).sum()
-    print("SANITY mapping bad_home:", bad_home, "bad_away:", bad_away)
 
+def coerce_feature_dtypes_for_lgbm(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    LightGBM requires int/float/bool — not object. SQL/nullable columns often
+    arrive as object (strings or mixed); coerce numeric features to float64.
+    """
+    out = X.copy()
+    cat_cols = {"team_id", "opp_id", "season"}
+    for c in out.columns:
+        if c in cat_cols:
+            out[c] = out[c].astype("category")
+            continue
+        out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
 
-# -----------------------------
-# DB / model utilities
-# -----------------------------
-@dataclass
-class MarketAgg:
-    game_id: int
-    p_home_market_median: float
-    n_books: int
-    home_price_consensus: int
-    away_price_consensus: int
-
-
-def ensure_output_table(engine, schema: str) -> None:
-    ddl = f"""
-    CREATE TABLE IF NOT EXISTS {schema}.inference_game_predictions (
-      as_of_ts TIMESTAMPTZ NOT NULL,
-      game_id BIGINT NOT NULL,
-      game_date DATE NOT NULL,
-
-      home_team TEXT,
-      away_team TEXT,
-
-      home_runs_pred DOUBLE PRECISION,
-      away_runs_pred DOUBLE PRECISION,
-      total_runs_pred DOUBLE PRECISION,
-      run_diff_pred DOUBLE PRECISION,
-
-      p_home_win_poisson DOUBLE PRECISION,
-      p_away_win_poisson DOUBLE PRECISION,
-
-      p_home_market_median DOUBLE PRECISION,
-      p_away_market_median DOUBLE PRECISION,
-      n_books INTEGER,
-
-      home_price_consensus INTEGER,
-      away_price_consensus INTEGER,
-
-      edge_home DOUBLE PRECISION,
-      edge_away DOUBLE PRECISION,
-
-      ev_home DOUBLE PRECISION,
-      ev_away DOUBLE PRECISION,
-
-      PRIMARY KEY (as_of_ts, game_id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_infer_game_date ON {schema}.inference_game_predictions (game_date);
-    CREATE INDEX IF NOT EXISTS idx_infer_game_id ON {schema}.inference_game_predictions (game_id);
-    """
-    with engine.begin() as conn:
-        conn.execute(text(ddl))
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 def fetch_games_and_features(engine, schema: str, date_str: str) -> pd.DataFrame:
-    col_q = text("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = :schema
-          AND table_name = :table
-        ORDER BY ordinal_position
-    """)
-    feat_cols_all = pd.read_sql(col_q, engine, params={"schema": schema, "table": "features_game"})["column_name"].tolist()
-
-    # avoid duplicates with games columns
-    drop = {"game_id", "game_date", "home_team_id", "away_team_id"}
-    feat_cols = [c for c in feat_cols_all if c not in drop]
-    feat_select = ",\n        ".join([f"f.{c}" for c in feat_cols])
-
     q = text(f"""
-      WITH tnames AS (
-        SELECT mlb_team_id, team_name
-        FROM {schema}.teams
-      )
-      SELECT
-        g.game_id,
-        g.game_date,
-        g.home_team_id,
-        g.away_team_id,
-        COALESCE(th.team_name, g.home_team_id::text) AS home_team,
-        COALESCE(ta.team_name, g.away_team_id::text) AS away_team,
-        {feat_select}
-      FROM {schema}.games g
-      JOIN {schema}.features_game f ON f.game_id = g.game_id
-      LEFT JOIN tnames th ON th.mlb_team_id = g.home_team_id
-      LEFT JOIN tnames ta ON ta.mlb_team_id = g.away_team_id
-      WHERE g.game_date = :d
-      ORDER BY g.game_id
-    """)
-
-    return pd.read_sql(q, engine, params={"d": date_str})
-def load_market_median(engine, schema: str, date_str: str, market: str = "h2h", max_abs_odds: int = 2000) -> pd.DataFrame:
-    """
-    Compute median across books using latest pulled_at per (game_id, sportsbook) for the date.
-    Steps:
-      1) select latest row per (game_id, sportsbook)
-      2) filter invalid odds
-      3) convert to implied probs, remove vig per book -> p_home_fair
-      4) median across books -> p_home_market_median, n_books
-      5) derive consensus odds from p_home_market_median (vig-free synthetic, for display/EV)
-    """
-    q = text(f"""
-      WITH latest AS (
-        SELECT DISTINCT ON (game_id, sportsbook)
-          game_id,
-          sportsbook,
-          home_price,
-          away_price,
-          pulled_at
-        FROM {schema}.odds_ml
-        WHERE market = :market
-          AND game_date = :d
-          AND game_id IS NOT NULL
-          AND home_price IS NOT NULL
-          AND away_price IS NOT NULL
-        ORDER BY game_id, sportsbook, pulled_at DESC
-      )
-      SELECT game_id, sportsbook, home_price, away_price
-      FROM latest
-    """)
-    df = pd.read_sql(q, engine, params={"market": market, "d": date_str})
+        SELECT g.game_id, g.game_date, g.home_team_id, g.away_team_id,
+               th.team_name AS home_team, ta.team_name AS away_team,
+               f.*,
+               gsp.home_sp_name, gsp.away_sp_name,
+               gw.temp_f AS gw_temp_f, gw.wind_mph AS gw_wind_mph,
+               gw.wind_dir_deg AS gw_wind_dir_deg,
+               gw.humidity AS gw_humidity, gw.precip_in AS gw_precip_in
+        FROM {schema}.games g
+        JOIN {schema}.features_game f ON f.game_id = g.game_id
+        LEFT JOIN {schema}.teams th ON th.mlb_team_id = g.home_team_id
+        LEFT JOIN {schema}.teams ta ON ta.mlb_team_id = g.away_team_id
+        LEFT JOIN {schema}.game_starting_pitchers gsp ON gsp.game_id = g.game_id
+        LEFT JOIN {schema}.game_weather gw ON gw.game_id = g.game_id
+        WHERE g.game_date = :d
+        ORDER BY g.game_id
+    """) 
+    df = pd.read_sql(q, engine, params={"d": date_str})
     df = df.loc[:, ~df.columns.duplicated()].copy()
-    if df.empty:
-        return df
 
-    hp = df["home_price"].astype(int).to_numpy()
-    ap = df["away_price"].astype(int).to_numpy()
+    for canon, backup, forecast in [
+        ("temp_f",     "gw_temp_f",      "forecast_temp_f"),
+        ("wind_mph",   "gw_wind_mph",    "forecast_wind_mph"),
+        ("wind_dir_deg","gw_wind_dir_deg","forecast_wind_dir_deg"),
+        ("humidity",   "gw_humidity",    "forecast_humidity"),
+        ("precip_in",  "gw_precip_in",   "forecast_precip_in"),
+    ]:
+        # Use game_weather actuals first, then forecast fallback
+        if canon not in df.columns:
+            df[canon] = np.nan
+        if backup in df.columns:
+            df[canon] = df[canon].where(df[canon].notna(), df[backup])
+        if forecast in df.columns:
+            df[canon] = df[canon].where(df[canon].notna(), df[forecast])
 
-    def valid_odds(x: np.ndarray) -> np.ndarray:
-        return ((x <= -100) | (x >= 100)) & (np.abs(x) <= max_abs_odds)
+    df = df.drop(columns=[
+        "gw_temp_f","gw_wind_mph","gw_wind_dir_deg","gw_humidity","gw_precip_in"
+    ], errors="ignore")
 
-    ok = valid_odds(hp) & valid_odds(ap)
-    df = df.loc[ok].copy()
-    if df.empty:
-        return df
-
-    hp = df["home_price"].astype(int).to_numpy()
-    ap = df["away_price"].astype(int).to_numpy()
-
-    p_home_imp = american_to_implied(hp)
-    p_away_imp = american_to_implied(ap)
-    denom = p_home_imp + p_away_imp
-    df["p_home_fair"] = p_home_imp / denom
-
-    agg = df.groupby("game_id").agg(
-        p_home_market_median=("p_home_fair", "median"),
-        n_books=("p_home_fair", "count"),
-    ).reset_index()
-
-    home_cons = prob_to_american(agg["p_home_market_median"].to_numpy())
-    away_cons = prob_to_american((1.0 - agg["p_home_market_median"]).to_numpy())
-    agg["home_price_consensus"] = home_cons
-    agg["away_price_consensus"] = away_cons
-    agg["p_away_market_median"] = 1.0 - agg["p_home_market_median"]
-
-    return agg
-
-
-def get_model_feature_names(model) -> List[str]:
-    """
-    Works for LightGBM sklearn wrapper saved via joblib.
-    """
-    # LGBMRegressor has .booster_ after fitting, and booster has feature_name()
-    if hasattr(model, "booster_") and model.booster_ is not None:
-        return list(model.booster_.feature_name())
-    if hasattr(model, "feature_name_"):
-        return list(model.feature_name_)
-    # Fallback: can't infer reliably
-    raise RuntimeError("Could not infer feature names from model. Ensure it's a fitted LightGBM model.")
-
-
-def prepare_X(df: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
-    missing = [c for c in feature_names if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"Missing required feature columns for model: {missing[:25]} (and {max(0, len(missing)-25)} more)")
-
-    X = df[feature_names].copy()
-
-    # LightGBM can handle categorical if dtype is category
-    for cat_col in ["venue_id", "park_id", "home_team_id", "away_team_id"]:
-        if cat_col in X.columns:
-            X[cat_col] = X[cat_col].astype("category")
-
-    # Ensure numeric for everything else
-    for c in X.columns:
-        if X[c].dtype == "object":
-            # Most of your feature cols should be numeric; objects are usually IDs/strings that should not be here.
-            raise RuntimeError(f"Non-numeric feature column detected in model inputs: {c} (dtype=object).")
-
-    return X
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--schema", default="public")
-    ap.add_argument("--date", required=True, help="YYYY-MM-DD")
-    ap.add_argument("--market", default="h2h")
-    ap.add_argument("--min_books", type=int, default=5)
-    ap.add_argument("--top_k", type=int, default=10)
-
-    ap.add_argument("--home_model", default="artifacts/runs_model_home_lgbm_optionA.joblib")
-    ap.add_argument("--away_model", default="artifacts/runs_model_away_lgbm_optionA.joblib")
-    ap.add_argument("--team_model", default="artifacts/runs_model_team_lgbm_optionA.joblib")
-    ap.add_argument("--team_features", default="artifacts/runs_model_team_features_optionA.txt")
-
-    args = ap.parse_args()
-
-    pg_dsn = os.getenv("PG_DSN")
-    if not pg_dsn:
-        raise RuntimeError("PG_DSN env var is required (postgresql+psycopg2://...).")
-
-    engine = create_engine(pg_dsn, pool_pre_ping=True)
-
-    ensure_output_table(engine, args.schema)
-
-    # Load game/features rows
-    df = fetch_games_and_features(engine, args.schema, args.date)
-    if df.empty:
-        print(f"No games found for {args.date} in {args.schema}.games (or missing join in features_game).")
-        return
-
-    # Market median (vig-free) from odds snapshots
-    mkt = load_market_median(engine, args.schema, args.date, market=args.market)
-    if mkt.empty:
-        print(f"Warning: No odds found for {args.date}. Market columns will be NULL; value bets won't be ranked.")
-        df = df.copy()
-        df["p_home_market_median"] = np.nan
-        df["p_away_market_median"] = np.nan
-        df["n_books"] = np.nan
-        df["home_price_consensus"] = np.nan
-        df["away_price_consensus"] = np.nan
-    else:
-        df = df.merge(mkt, on="game_id", how="left")
-
-    # Load single team runs model + feature list
-    team_model = joblib.load(args.team_model)
-    with open(args.team_features, "r") as f:
-        team_feature_cols = [line.strip() for line in f if line.strip()]
-
-    # Add season to df (if not already there)
     if "season" not in df.columns:
         df["season"] = pd.to_datetime(df["game_date"]).dt.year
 
-    # Predict runs using the single team model
-    df = predict_game_runs_from_team_model(df, team_model, team_feature_cols)
+    return df
 
-    # Clip negative run preds (Tweedie can output small negatives)
-    df["home_runs_pred"] = df["home_runs_pred"].clip(lower=0.1)
-    df["away_runs_pred"] = df["away_runs_pred"].clip(lower=0.1)
-    df["total_runs_pred"] = df["home_runs_pred"] + df["away_runs_pred"]
-    df["run_diff_pred"] = df["home_runs_pred"] - df["away_runs_pred"]
 
-    # Temporary home-advantage correction for bias testing (do not overwrite home_runs_pred) for bias testing (do not overwrite home_runs_pred)
-    HOME_ADV_RUNS = 0.0  # temporary correction test
-    df["home_runs_pred_adj"] = df["home_runs_pred"] + HOME_ADV_RUNS
-    df["away_runs_pred_adj"] = df["away_runs_pred"]
+def fetch_odds_api(date_str: str, api_key: str) -> pd.DataFrame:
+    """Single Odds API call — returns h2h + totals for all MLB games on date."""
+    url = f"https://api.the-odds-api.com/v4/sports/{ODDS_API_SPORT}/odds/"
+    params = {
+        "apiKey":    api_key,
+        "regions":   "us",
+        "markets":   "h2h,totals",
+        "oddsFormat":"american",
+        "dateFormat":"iso",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  Odds API error: {e}")
+        return pd.DataFrame()
 
-    # Poisson home win probability (using adjusted runs for correction test).
-    # Team model outputs home_runs_pred for away row and away_runs_pred for home row, so swap lambdas.
-    df["p_home_win_poisson"] = [
-        p_home_win_from_lambdas(a, h)
-        for h, a in zip(df["home_runs_pred_adj"].values, df["away_runs_pred_adj"].values)
+    records = []
+    for g in resp.json():
+        # Convert UTC to PT before date comparison — late PT games are next day UTC
+        commence_utc = pd.to_datetime(g.get("commence_time", ""), utc=True)
+        commence_pt = commence_utc.tz_convert("America/Los_Angeles").date()
+        if str(commence_pt) != date_str:
+            continue
+        # Skip games that have already started — use stored closing odds instead
+        if commence_utc <= pd.Timestamp.now(tz="UTC"):
+            continue
+
+        home_team = g.get("home_team", "")
+        away_team = g.get("away_team", "")
+
+        ml_h, ml_a = [], []
+        ou_lines, ou_over_px, ou_under_px = [], [], []
+
+        for bk in g.get("bookmakers", []):
+            for mkt in bk.get("markets", []):
+                if mkt["key"] == "h2h":
+                    for o in mkt["outcomes"]:
+                        if o["name"] == home_team:
+                            ml_h.append(o["price"])
+                        elif o["name"] == away_team:
+                            ml_a.append(o["price"])
+                elif mkt["key"] == "totals":
+                    for o in mkt["outcomes"]:
+                        if o["name"] == "Over":
+                            ou_lines.append(o.get("point", np.nan))
+                            ou_over_px.append(o["price"])
+                        elif o["name"] == "Under":
+                            ou_under_px.append(o["price"])
+
+        # Moneyline
+        p_home_fair = p_away_fair = np.nan
+        home_px = away_px = np.nan
+        n_ml = 0
+        if ml_h and ml_a:
+            n_ml = min(len(ml_h), len(ml_a))
+            ph = american_to_implied(np.array(ml_h[:n_ml]))
+            pa = american_to_implied(np.array(ml_a[:n_ml]))
+            p_home_fair = float(np.median(ph / (ph + pa)))
+            p_away_fair = 1.0 - p_home_fair
+            home_px = int(prob_to_american(np.array([p_home_fair]))[0])
+            away_px = int(prob_to_american(np.array([p_away_fair]))[0])
+
+        # Totals
+        ou_line = ou_over_price = ou_under_price = np.nan
+        n_ou = 0
+        if ou_lines and ou_over_px and ou_under_px:
+            n_ou = min(len(ou_lines), len(ou_over_px), len(ou_under_px))
+            ou_line        = float(np.median(ou_lines[:n_ou]))
+            ou_over_price  = float(np.median(ou_over_px[:n_ou]))
+            ou_under_price = float(np.median(ou_under_px[:n_ou]))
+
+        records.append({
+            "api_home_team":        home_team,
+            "api_away_team":        away_team,
+            "p_home_market_median": p_home_fair,
+            "p_away_market_median": p_away_fair,
+            "home_price_consensus": home_px,
+            "away_price_consensus": away_px,
+            "n_books_ml":           n_ml,
+            "ou_line":              ou_line,
+            "ou_over_price":        ou_over_price,
+            "ou_under_price":       ou_under_price,
+            "n_books_ou":           n_ou,
+        })
+
+    return pd.DataFrame(records)
+
+
+def match_odds_to_games(df_games: pd.DataFrame, df_odds: pd.DataFrame) -> pd.DataFrame:
+    """Match Odds API team names to DB team names (exact then partial)."""
+    odds_cols = [
+        "p_home_market_median", "p_away_market_median",
+        "home_price_consensus", "away_price_consensus", "n_books_ml",
+        "ou_line", "ou_over_price", "ou_under_price", "n_books_ou",
     ]
+
+    if df_odds.empty:
+        for col in odds_cols:
+            df_games[col] = np.nan
+        return df_games
+
+    result = df_games.copy()
+    for col in odds_cols:
+        result[col] = np.nan
+
+    lookup = {
+        (r["api_away_team"].lower().strip(), r["api_home_team"].lower().strip()): r
+        for _, r in df_odds.iterrows()
+    }
+
+    for idx, game in result.iterrows():
+        ht = game["home_team"].lower().strip()
+        at = game["away_team"].lower().strip()
+        matched = lookup.get((at, ht))
+
+        if matched is None:
+            for (ka, kh), row in lookup.items():
+                if set(ht.split()) & set(kh.split()) and set(at.split()) & set(ka.split()):
+                    matched = row
+                    break
+
+        if matched is not None:
+            for col in odds_cols:
+                result.at[idx, col] = matched.get(col, np.nan)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Output table
+# ---------------------------------------------------------------------------
+
+def ensure_output_table(engine, schema: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS {schema}.inference_game_predictions (
+            as_of_ts                TIMESTAMPTZ      NOT NULL,
+            game_id                 BIGINT           NOT NULL,
+            game_date               DATE             NOT NULL,
+            home_team               TEXT,
+            away_team               TEXT,
+            home_runs_pred          DOUBLE PRECISION,
+            away_runs_pred          DOUBLE PRECISION,
+            total_runs_pred         DOUBLE PRECISION,
+            run_diff_pred           DOUBLE PRECISION,
+            p_home_win_raw          DOUBLE PRECISION,
+            p_home_win_poisson      DOUBLE PRECISION,
+            p_away_win_poisson      DOUBLE PRECISION,
+            p_home_market_median    DOUBLE PRECISION,
+            p_away_market_median    DOUBLE PRECISION,
+            n_books_ml              INTEGER,
+            home_price_consensus    INTEGER,
+            away_price_consensus    INTEGER,
+            ou_line                 DOUBLE PRECISION,
+            ou_over_price           DOUBLE PRECISION,
+            ou_under_price          DOUBLE PRECISION,
+            n_books_ou              INTEGER,
+            p_over                  DOUBLE PRECISION,
+            p_under                 DOUBLE PRECISION,
+            ou_recommendation       TEXT,
+            edge_home               DOUBLE PRECISION,
+            edge_away               DOUBLE PRECISION,
+            ou_edge_over            DOUBLE PRECISION,
+            ou_edge_under           DOUBLE PRECISION,
+            ev_home                 DOUBLE PRECISION,
+            ev_away                 DOUBLE PRECISION,
+            ev_over                 DOUBLE PRECISION,
+            ev_under                DOUBLE PRECISION,
+            is_value_ml_home        BOOLEAN,
+            is_value_ml_away        BOOLEAN,
+            is_value_ou_over        BOOLEAN,
+            is_value_ou_under       BOOLEAN,
+            PRIMARY KEY (as_of_ts, game_id)
+        );
+        """))
+
+
+# ---------------------------------------------------------------------------
+# Consistency check
+# ---------------------------------------------------------------------------
+
+def assert_predictions_consistent(df: pd.DataFrame) -> None:
+    violations = []
+    for i, row in df.iterrows():
+        lh, la = float(row["home_runs_pred"]), float(row["away_runs_pred"])
+        if abs(lh - la) < 0.01:
+            continue
+        p_act  = float(1.0 - skellam.cdf(0,lh,la) - skellam.pmf(0,lh,la)) / \
+                 max(float(1.0 - skellam.pmf(0,lh,la)), 1e-9)
+        p_swap = float(1.0 - skellam.cdf(0,la,lh) - skellam.pmf(0,la,lh)) / \
+                 max(float(1.0 - skellam.pmf(0,la,lh)), 1e-9)
+        if not ((lh > la) == (p_act > p_swap)):
+            violations.append(f"  {row.get('home_team','?')} vs {row.get('away_team','?')}: lh={lh:.3f} la={la:.3f}")
+    if violations:
+        raise RuntimeError("CONSISTENCY VIOLATION:\n" + "\n".join(violations))
+    print(f"  Consistency check passed: {len(df)} games.")
+
+
+# ---------------------------------------------------------------------------
+# Dashboards
+# ---------------------------------------------------------------------------
+
+def print_all_games(df: pd.DataFrame) -> None:
+    W = 118
+    print(f"\n{'⚾  ALL GAMES — ' + str(df['game_date'].iloc[0])[:10]:^{W}}")
+    print("─" * W)
+    print(f"{'AWAY TEAM':<22} {'HOME TEAM':<22} "
+          f"{'AWAY SP':<20} {'HOME SP':<20}" 
+          f"{'AWAY PRED':>9} {'HOME PRED':>9} {'TOTAL':>6} "
+          f"{'LINE':>6} {'P_OVER':>7} {'P_UNDR':>7} "
+          f"{'REC':>5} {'P_WIN_A':>8} {'P_WIN_H':>8}")
+    print("─" * W)
+
+    for _, r in df.iterrows():
+        ap   = f"{r['away_runs_pred']:.2f}"    if pd.notna(r.get('away_runs_pred'))   else "—"
+        hp   = f"{r['home_runs_pred']:.2f}"    if pd.notna(r.get('home_runs_pred'))   else "—"
+        tot  = f"{r['total_runs_pred']:.1f}"   if pd.notna(r.get('total_runs_pred'))  else "—"
+        line = f"{r['ou_line']:.1f}"           if pd.notna(r.get('ou_line'))          else "—"
+        po   = f"{r['p_over']*100:.0f}%"       if pd.notna(r.get('p_over'))           else "—"
+        pu   = f"{r['p_under']*100:.0f}%"      if pd.notna(r.get('p_under'))          else "—"
+        rec  = r.get('ou_recommendation') or "—"
+        pwa  = f"{r['p_away_win_poisson']*100:.0f}%" if pd.notna(r.get('p_away_win_poisson')) else "—"
+        pwh  = f"{r['p_home_win_poisson']*100:.0f}%" if pd.notna(r.get('p_home_win_poisson')) else "—"
+
+        away_sp = (r.get('away_sp_name') or '—')[:16]
+        home_sp = (r.get('home_sp_name') or '—')[:16]
+
+        print(f"{r['away_team']:<22} {r['home_team']:<22} "
+              f"{away_sp:<18} {home_sp:<18} "
+              f"{ap:>9} {hp:>9} {tot:>6} "
+              f"{line:>6} {po:>7} {pu:>7} "
+              f"{rec:>5} {pwa:>8} {pwh:>8}")
+
+    print("─" * W)
+    print("  REC = model O/U recommendation based on predicted total vs line")
+    print("  P_WIN = calibrated win probability")
+
+
+def print_value_bets(df: pd.DataFrame, ml_thresh: float,
+                     ou_thresh: float, min_diff: float) -> None:
+    W = 120
+    print(f"\n{'💰  VALUE BETS':^{W}}")
+    print("─" * W)
+    print(f"  Filters: ML edge ≥ {ml_thresh:.0%}  |  O/U edge ≥ {ou_thresh:.0%}  "
+          f"|  |run diff| ≥ {min_diff:.1f} runs (ML only)")
+    print("─" * W)
+    print(f"{'TYPE':<5} {'AWAY':<21} {'HOME':<21} {'SIDE':<6} "
+          f"{'MDL%':>5} {'MKT%':>5} {'EDGE':>6} "
+          f"{'LINE':>5} {'MDL_TOT':>8} {'REC':>5} "
+          f"{'EV':>7}  {'ODDS':>6}")
+    print("─" * W)
+
+    any_bet = False
+
+    for _, r in df.iterrows():
+        away = r['away_team'][:19]
+        home = r['home_team'][:19]
+        rdiff = abs(float(r.get('run_diff_pred') or 0))
+
+        # Moneyline value bets
+        if rdiff >= min_diff:
+            for side, pc, mc, ec, evc, prc in [
+                ("HOME", "p_home_win_poisson", "p_home_market_median",
+                 "edge_home", "ev_home", "home_price_consensus"),
+                ("AWAY", "p_away_win_poisson", "p_away_market_median",
+                 "edge_away", "ev_away", "away_price_consensus"),
+            ]:
+                edge = r.get(ec)
+                if pd.isna(edge) or edge < ml_thresh:
+                    continue
+                mp  = r.get(pc, np.nan)
+                mkp = r.get(mc, np.nan)
+                ev  = r.get(evc, np.nan)
+                px  = r.get(prc, np.nan)
+                print(f"{'ML':<5} {away:<21} {home:<21} {side:<6} "
+                      f"{mp*100:>4.1f}% {mkp*100:>4.1f}% {edge*100:>+5.1f}% "
+                      f"{'—':>5} {'—':>8} {'—':>5} "
+                      f"{ev:>+6.3f}u  {int(px):>+6d}" if pd.notna(ev) and pd.notna(px)
+                      else
+                      f"{'ML':<5} {away:<21} {home:<21} {side:<6} "
+                      f"{mp*100:>4.1f}% {mkp*100:>4.1f}% {edge*100:>+5.1f}% "
+                      f"{'—':>5} {'—':>8} {'—':>5} {'—':>7}  {'—':>6}")
+                any_bet = True
+
+        # O/U value bets
+        ou = r.get('ou_line')
+        if pd.notna(ou):
+            tot = r.get('total_runs_pred', np.nan)
+            rec = r.get('ou_recommendation', '—')
+            for side, pc, ec, evc, prc in [
+                ("OVER",  "p_over",  "ou_edge_over",  "ev_over",  "ou_over_price"),
+                ("UNDER", "p_under", "ou_edge_under", "ev_under", "ou_under_price"),
+            ]:
+                edge = r.get(ec)
+                if pd.isna(edge) or edge < ou_thresh:
+                    continue
+                mp  = r.get(pc, np.nan)
+                px  = r.get(prc, np.nan)
+                ev  = r.get(evc, np.nan)
+                mkt = implied_from_american(px) if pd.notna(px) else np.nan
+                tot_s = f"{tot:.1f}" if pd.notna(tot) else "—"
+                ev_s  = f"{ev:+.3f}u" if pd.notna(ev) else "—"
+                px_s  = f"{int(px):+d}" if pd.notna(px) else "—"
+                mkt_s = f"{mkt*100:.1f}%" if pd.notna(mkt) else "—"
+                print(f"{'O/U':<5} {away:<21} {home:<21} {side:<6} "
+                      f"{mp*100:>4.1f}% {mkt_s:>5} {edge*100:>+5.1f}% "
+                      f"{ou:>5.1f} {tot_s:>8} {rec:>5} "
+                      f"{ev_s:>7}  {px_s:>6}")
+                any_bet = True
+
+    if not any_bet:
+        print("  No value bets found at current thresholds.")
+        print(f"  Try: --ml_edge_threshold 0.03 --ou_edge_threshold 0.03 --min_run_diff 0.5")
+    print("─" * W)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date",               required=True)
+    ap.add_argument("--schema",             default="public")
+    ap.add_argument("--team_model",         required=True)
+    ap.add_argument("--team_features",      required=True)
+    ap.add_argument("--calibrator",         default=None)
+    ap.add_argument("--no_calibrate",       action="store_true")
+    ap.add_argument("--fill_missing",       action="store_true")
+    ap.add_argument("--ml_edge_threshold",  type=float, default=0.05)
+    ap.add_argument("--ou_edge_threshold",  type=float, default=0.05)
+    ap.add_argument("--min_run_diff",       type=float, default=0.8)
+    args = ap.parse_args()
+
+    pg_dsn  = os.getenv("PG_DSN")
+    api_key = os.getenv("ODDS_API_KEY")
+    if not pg_dsn:
+        raise RuntimeError("PG_DSN env var required.")
+
+    engine = create_engine(pg_dsn, pool_pre_ping=True)
+    ensure_output_table(engine, args.schema)
+
+    # Calibrator
+    calibrator = None
+    if args.calibrator and not args.no_calibrate:
+        if os.path.exists(args.calibrator):
+            calibrator = joblib.load(args.calibrator)
+            print(f"  Calibrator: {args.calibrator}")
+        else:
+            print(f"  Warning: calibrator not found at {args.calibrator}")
+
+    # Games
+    df = fetch_games_and_features(engine, args.schema, args.date)
+    if df.empty:
+        print(f"No games found for {args.date}")
+        return
+    print(f"Found {len(df)} games for {args.date}")
+    df = add_game_level_diff_features(df)
+
+    # Odds
+    if api_key:
+        print("Fetching odds from The Odds API...")
+        df_odds = fetch_odds_api(args.date, api_key)
+        n_matched = len(df_odds)
+        print(f"  API returned {n_matched} games")
+        df = match_odds_to_games(df, df_odds)
+
+    if not api_key or n_matched < len(df):
+        print("  Falling back to morning odds from features_game...")
+        for col, fg_col in [
+            ("p_home_market_median", "morning_p_home"),
+            ("ou_line",              "morning_ou_line"),
+        ]:
+            if fg_col in df.columns and col in df.columns:
+                df[col] = df[col].where(df[col].notna(), df[fg_col])
+    # Derive away probability and consensus prices from morning pull
+        if "morning_p_home" in df.columns:
+            mask = df["p_home_market_median"].isna() & df["morning_p_home"].notna()
+            df.loc[mask, "p_home_market_median"] = df.loc[mask, "morning_p_home"].astype(float)
+            df.loc[mask, "p_away_market_median"] = (1.0 - df.loc[mask, "morning_p_home"].astype(float))
+            # Convert to American odds for display
+            for idx in df[mask].index:
+                p = float(df.at[idx, "p_home_market_median"])
+                df.at[idx, "home_price_consensus"] = int(
+                    -100*p/(1-p) if p >= 0.5 else 100*(1-p)/p)
+                p_a = 1.0 - p
+                df.at[idx, "away_price_consensus"] = int(
+                    -100*p_a/(1-p_a) if p_a >= 0.5 else 100*(1-p_a)/p_a)
+    if not api_key:
+        print("  ODDS_API_KEY not set — odds columns will be NaN")
+        for col in ["p_home_market_median","p_away_market_median",
+                    "home_price_consensus","away_price_consensus","n_books_ml",
+                    "ou_line","ou_over_price","ou_under_price","n_books_ou"]:
+            df[col] = np.nan
+
+    # Model features
+    # Ensure odds columns are float dtype before saving
+    float_cols = ['p_home_market_median','p_away_market_median','ou_line',
+                  'ou_over_price','ou_under_price','home_price_consensus','away_price_consensus']
+    for col in float_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    team_model = joblib.load(args.team_model)
+    with open(args.team_features) as f:
+        feature_cols = [l.strip() for l in f if l.strip()]
+
+    XH, XA = build_team_rows(df, feature_cols)
+
+    combined = pd.concat([XH, XA]).isna().mean()
+    pt_miss  = combined[~combined.index.isin(NAN_PASSTHROUGH_FEATURES)]
+    pt_miss  = pt_miss[pt_miss > 0]
+    wx_miss  = combined[combined.index.isin(NAN_PASSTHROUGH_FEATURES)]
+    if not wx_miss.empty:
+        print(f"  NaN-passthrough missing: {wx_miss.mean()*100:.1f}% avg")
+    if not pt_miss.empty:
+        if not args.fill_missing:
+            raise RuntimeError(f"Missing features:\n{(pt_miss*100).round(1).to_string()}\nPass --fill_missing")
+        non_pt = [c for c in feature_cols if c not in NAN_PASSTHROUGH_FEATURES]
+        XH[non_pt] = XH[non_pt].fillna(0.0)
+        XA[non_pt] = XA[non_pt].fillna(0.0)
+
+    # Predict
+    # Predict — model outputs residuals from league mean
+    df = df.reset_index(drop=True)
+
+    XH = coerce_feature_dtypes_for_lgbm(XH)
+    XA = coerce_feature_dtypes_for_lgbm(XA)
+
+    # Step 1: raw residual predictions
+    home_residuals = team_model.predict(XH).astype(float)
+    away_residuals = team_model.predict(XA).astype(float)
+
+    # Step 2: get league baseline — per-team average over prior 60 days
+    league_baseline = df["league_avg_runs_60d"].fillna(TRAINING_LEAGUE_MEAN).values
+
+    # Step 3: add baseline back to get actual run predictions
+    df["home_runs_pred"] = np.clip(home_residuals + league_baseline, 0.1, None)
+    df["away_runs_pred"] = np.clip(away_residuals + league_baseline, 0.1, None)
+    df["total_runs_pred"] = df["home_runs_pred"] + df["away_runs_pred"]
+    df["run_diff_pred"]   = df["home_runs_pred"] - df["away_runs_pred"]
+
+    # Win probability from corrected predictions
+    df["p_home_win_raw"] = [
+        p_home_win_from_lambdas(h, a)
+        for h, a in zip(df["home_runs_pred"].values, df["away_runs_pred"].values)
+    ]
+
+    
+    if calibrator is not None:
+        df["p_home_win_poisson"] = calibrator.predict(df["p_home_win_raw"].values)
+    else:
+        df["p_home_win_poisson"] = df["p_home_win_raw"]
     df["p_away_win_poisson"] = 1.0 - df["p_home_win_poisson"]
 
-    # Edge vs market
-    df["edge_home"] = df["p_home_win_poisson"] - df["p_home_market_median"]
-    df["edge_away"] = df["p_away_win_poisson"] - df["p_away_market_median"]
+    assert_predictions_consistent(df)
 
-    # EV vs consensus (vig-free) odds derived from p_market_median
-    # NOTE: Since consensus odds are vig-free, this EV is an "edge signal", not a true book-execution EV.
-    df["ev_home"] = np.nan
-    df["ev_away"] = np.nan
-    for i in range(len(df)):
-        hp = df.loc[i, "home_price_consensus"]
-        ap = df.loc[i, "away_price_consensus"]
-        if pd.isna(hp) or pd.isna(ap):
-            continue
-        b_home = profit_if_win_1u(float(hp))
-        b_away = profit_if_win_1u(float(ap))
-        p_home = float(df.loc[i, "p_home_win_poisson"])
-        p_away = 1.0 - p_home
-        df.loc[i, "ev_home"] = p_home * b_home - (1.0 - p_home)
-        df.loc[i, "ev_away"] = p_away * b_away - (1.0 - p_away)
+    # O/U
+    p_over_l, p_under_l, rec_l = [], [], []
+    for _, row in df.iterrows():
+        ou = row.get("ou_line")
+        if pd.notna(ou):
+            po, pu, _ = p_over_under(row["home_runs_pred"], row["away_runs_pred"], ou)
+            p_over_l.append(po)
+            p_under_l.append(pu)
+            t = row["total_runs_pred"]
+            rec_l.append("OVER" if t > ou + 0.3 else "UNDER" if t < ou - 0.3 else "PUSH")
+        else:
+            p_over_l.append(np.nan)
+            p_under_l.append(np.nan)
+            rec_l.append(None)
 
-    # Aliases and best-side columns for insert (same logic as ranked display below)
-    df["p_home_model"] = df["p_home_win_poisson"]
-    df["p_away_model"] = df["p_away_win_poisson"]
-    EDGE_MIN = 0.01
+    df["p_over"]            = p_over_l
+    df["p_under"]           = p_under_l
+    df["ou_recommendation"] = rec_l
 
-    df["best_side"] = np.where(df["edge_home"] >= df["edge_away"], "HOME", "AWAY")
-    df["best_edge"] = np.maximum(df["edge_home"], df["edge_away"])
+    # Edges
+    df["edge_home"]     = df["p_home_win_poisson"] - df["p_home_market_median"]
+    df["edge_away"]     = df["p_away_win_poisson"] - df["p_away_market_median"]
+    df["ou_edge_over"]  = df.apply(lambda r: r["p_over"]  - implied_from_american(r.get("ou_over_price"))
+                                   if pd.notna(r.get("p_over")) else np.nan, axis=1)
+    df["ou_edge_under"] = df.apply(lambda r: r["p_under"] - implied_from_american(r.get("ou_under_price"))
+                                   if pd.notna(r.get("p_under")) else np.nan, axis=1)
 
-    # If not positive enough, mark as no bet
-    df.loc[df["best_edge"] < EDGE_MIN, "best_side"] = "NO_BET"
-    df.loc[df["best_edge"] < EDGE_MIN, ["best_edge", "best_p_model", "best_p_market", "best_ev"]] = np.nan
+    # EV
+    for ev_col, p_col, price_col in [
+        ("ev_home",  "p_home_win_poisson", "home_price_consensus"),
+        ("ev_away",  "p_away_win_poisson", "away_price_consensus"),
+        ("ev_over",  "p_over",             "ou_over_price"),
+        ("ev_under", "p_under",            "ou_under_price"),
+    ]:
+        evs = []
+        for i in df.index:
+            px = df.at[i, price_col]
+            p  = df.at[i, p_col]
+            if pd.notna(px) and pd.notna(p):
+                b = profit_if_win_1u(float(px))
+                evs.append(float(p) * b - (1.0 - float(p)) if pd.notna(b) else np.nan)
+            else:
+                evs.append(np.nan)
+        df[ev_col] = evs
 
-    df["best_p_model"] = np.where(
-        df["best_side"] == "HOME", df["p_home_win_poisson"],
-        np.where(df["best_side"] == "AWAY", df["p_away_win_poisson"], np.nan)
-    )
-    df["best_p_market"] = np.where(
-        df["best_side"] == "HOME", df["p_home_market_median"],
-        np.where(df["best_side"] == "AWAY", df["p_away_market_median"], np.nan)
-    )
-    df["best_ev"] = np.where(
-        df["best_side"] == "HOME", df["ev_home"],
-        np.where(df["best_side"] == "AWAY", df["ev_away"], np.nan)
-    )
+    # Value flags
+    df["is_value_ml_home"]  = (df["run_diff_pred"].abs() >= args.min_run_diff) & \
+                               (df["edge_home"].fillna(-1)     >= args.ml_edge_threshold)
+    df["is_value_ml_away"]  = (df["run_diff_pred"].abs() >= args.min_run_diff) & \
+                               (df["edge_away"].fillna(-1)     >= args.ml_edge_threshold)
+    df["is_value_ou_over"]  = df["ou_edge_over"].fillna(-1)  >= args.ou_edge_threshold
+    df["is_value_ou_under"] = df["ou_edge_under"].fillna(-1) >= args.ou_edge_threshold
 
-    # Save to Postgres (append with as_of_ts)
-    as_of = pd.Timestamp.now("UTC")
-
+    # Save
     out_cols = [
-        "game_id", "game_date", "home_team", "away_team",
-        "home_runs_pred", "away_runs_pred", "total_runs_pred", "run_diff_pred",
-        "p_home_win_poisson", "p_away_win_poisson",
-
-        # model final
-        "p_home_model", "p_away_model",
-
-        # market
-        "p_home_market_median", "p_away_market_median", "n_books",
-        "home_price_consensus", "away_price_consensus",
-
-        # per-side diagnostics
-        "edge_home", "edge_away", "ev_home", "ev_away",
-
-        # frontend recommendation
-        "best_side", "best_edge", "best_ev", "best_p_model", "best_p_market",
+        "game_id","game_date","home_team","away_team",
+        "home_runs_pred","away_runs_pred","total_runs_pred","run_diff_pred",
+        "p_home_win_raw","p_home_win_poisson","p_away_win_poisson",
+        "p_home_market_median","p_away_market_median","n_books_ml",
+        "home_price_consensus","away_price_consensus",
+        "ou_line","ou_over_price","ou_under_price","n_books_ou",
+        "p_over","p_under","ou_recommendation",
+        "edge_home","edge_away","ou_edge_over","ou_edge_under",
+        "ev_home","ev_away","ev_over","ev_under",
+        "is_value_ml_home","is_value_ml_away","is_value_ou_over","is_value_ou_under",
     ]
     out = df[out_cols].copy()
-    out.insert(0, "as_of_ts", as_of)
-
-    # Replace NaN with None so Postgres gets NULL; cast int-like cols to int (avoids out-of-range from nan)
-    records = out.to_dict(orient="records")
-    int_cols = {"game_id", "n_books", "home_price_consensus", "away_price_consensus"}
-    for r in records:
-        for k, v in r.items():
-            if pd.isna(v):
-                r[k] = None
-            elif k in int_cols and v is not None:
-                try:
-                    r[k] = int(v)
-                except (ValueError, TypeError):
-                    r[k] = None
-
-    insert_sql = text(f"""
-        INSERT INTO {args.schema}.inference_game_predictions (
-            as_of_ts, game_id, game_date,
-            home_team, away_team,
-            home_runs_pred, away_runs_pred, total_runs_pred, run_diff_pred,
-            p_home_win_poisson, p_away_win_poisson,
-
-            p_home_model, p_away_model,
-
-            p_home_market_median, p_away_market_median, n_books,
-            home_price_consensus, away_price_consensus,
-            edge_home, edge_away,
-            ev_home, ev_away,
-
-            best_side, best_edge, best_ev, best_p_model, best_p_market
-        ) VALUES (
-            :as_of_ts, :game_id, :game_date,
-            :home_team, :away_team,
-            :home_runs_pred, :away_runs_pred, :total_runs_pred, :run_diff_pred,
-            :p_home_win_poisson, :p_away_win_poisson,
-
-            :p_home_model, :p_away_model,
-
-            :p_home_market_median, :p_away_market_median, :n_books,
-            :home_price_consensus, :away_price_consensus,
-            :edge_home, :edge_away,
-            :ev_home, :ev_away,
-
-            :best_side, :best_edge, :best_ev, :best_p_model, :best_p_market
-        )
-    """)
+    out.insert(0, "as_of_ts", pd.Timestamp.now("UTC").floor("min"))
 
     with engine.begin() as conn:
-        conn.execute(text("SET LOCAL statement_timeout = '0'"))
-        conn.execute(insert_sql, records)
+        tmp = f"_inf_tmp_{args.date.replace('-','')}"
+        out.to_sql(tmp, conn, schema=args.schema,
+                   if_exists="replace", index=False, method="multi")
+        col_names  = ", ".join(out.columns)
+        set_clause = ", ".join(f"{c} = EXCLUDED.{c}"
+                               for c in out.columns if c not in ("as_of_ts","game_id"))
+        conn.execute(text(f"""
+            INSERT INTO {args.schema}.inference_game_predictions ({col_names})
+            SELECT {col_names} FROM {args.schema}.{tmp}
+            ON CONFLICT (as_of_ts, game_id) DO UPDATE SET {set_clause}
+        """))
+        conn.execute(text(f"DROP TABLE IF EXISTS {args.schema}.{tmp}"))
 
-    print(f"Saved {len(out):,} rows to {args.schema}.inference_game_predictions for date={args.date} as_of_ts={as_of}.")
+    print(f"  Saved {len(out)} predictions for {args.date}")
 
-    # Print Top K value bets using the SAME best_* already computed on df
-    ranked = df.copy()
+    # Dashboards
+    print_all_games(df)
+    print_value_bets(df, args.ml_edge_threshold, args.ou_edge_threshold, args.min_run_diff)
 
-    ranked = ranked[ranked["n_books"].fillna(0).astype(int) >= args.min_books].copy()
-    if ranked.empty:
-        print(f"No games met min_books={args.min_books}; falling back to min_books=1 for display.")
-        ranked = df[df["n_books"].fillna(0).astype(int) >= 1].copy()
-
-    ranked = ranked.dropna(subset=["p_home_market_median", "p_home_win_poisson"])
-
-    # only bets (not NO_BET) and already thresholded by EDGE_MIN earlier
-    ranked = ranked[ranked["best_side"] != "NO_BET"].copy()
-
-    if ranked.empty:
-        print(f"No games met EDGE_MIN={EDGE_MIN} and min_books={args.min_books} for {args.date}.")
-        return
-
-    ranked = ranked.sort_values("best_edge", ascending=False).head(args.top_k)
-
-    top = ranked[[
-        "game_id", "game_date", "away_team", "home_team",
-        "best_side", "best_edge", "best_p_model", "best_p_market", "best_ev", "n_books"
-    ]].copy()
-
-    print("\nTop value bets (ranked by model-market edge; median across books):")
-    print(top.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-
-    # Sanity checks
-    df["sum_market"] = df["p_home_market_median"] + df["p_away_market_median"]
-    df["sum_model"]  = df["p_home_win_poisson"] + df["p_away_win_poisson"]
-
-    print("\nSANITY CHECKS:")
-    print("market sum min/mean/max:",
-        df["sum_market"].min(), df["sum_market"].mean(), df["sum_market"].max())
-    print("model sum min/mean/max:",
-        df["sum_model"].min(), df["sum_model"].mean(), df["sum_model"].max())
-
-    print("\nEDGE MEANS:")
-    print("edge_home mean:", df["edge_home"].mean(), "edge_away mean:", df["edge_away"].mean())
-
-    print("\nTOP 5 biggest edges (abs) with both sides shown:")
-    tmp = df[[
-        "away_team","home_team",
-        "p_home_win_poisson","p_home_market_median","edge_home",
-        "p_away_win_poisson","p_away_market_median","edge_away",
-        "n_books"
-    ]].copy()
-    tmp["abs_max_edge"] = np.maximum(tmp["edge_home"].abs(), tmp["edge_away"].abs())
-    print(tmp.sort_values("abs_max_edge", ascending=False).head(5).to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-
-    g = df[df["game_id"] == 745852].iloc[0]
-    print("\nGAME 745852 CHECK")
-    print(g["away_team"], "@", g["home_team"])
-    print("home_runs_pred:", g["home_runs_pred"], "away_runs_pred:", g["away_runs_pred"])
-    print("p_home_win (as-is):", g["p_home_win_poisson"])
-    print("p_home_win (if swapped lambdas):", p_home_win_from_lambdas(g["away_runs_pred"], g["home_runs_pred"]))
-    print("p_home_market:", g["p_home_market_median"])
-
-    print("run_diff_pred mean:", df["run_diff_pred"].mean())
-    print("run_diff_pred std :", df["run_diff_pred"].std())
-    print("run_diff_pred min/max:", df["run_diff_pred"].min(), df["run_diff_pred"].max())
-    print("Mean market home prob:", df["p_home_market_median"].mean())
-    print("Mean model home prob :", df["p_home_win_poisson"].mean())
-
-    print("Mean home_runs_pred:", df["home_runs_pred"].mean())
-    print("Mean away_runs_pred:", df["away_runs_pred"].mean())
-    print("Mean (home-away) predicted runs:", (df["home_runs_pred"] - df["away_runs_pred"]).mean())
 
 if __name__ == "__main__":
     main()
