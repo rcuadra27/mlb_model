@@ -20,7 +20,7 @@ MLB Stats API / Statcast / Odds API
 - **Algorithm**: LightGBM (`runs_model_v8`)
 - **Approach**: Residual regression — predicts deviation from league average runs (4.50)
 - **Target**: `actual_runs - league_avg_runs_60d` per team per game
-- **49 features**: SP ERA/xwoba/K-rate, lineup xwoba/barrel rate, team rolling stats (7d/15d/30d/60d), park factors, umpire tendencies, weather, market odds
+- **49 features**: SP ERA/xwoba/K-rate, lineup xwoba/barrel rate, team rolling stats (7d/15d/30d/60d), park factors, umpire tendencies, weather
 - **Win probability**: Skellam distribution from predicted run totals (0.30–0.70 cap)
 - **No calibration**: Raw Skellam probabilities (`--no_calibrate`)
 
