@@ -190,7 +190,6 @@ def main():
     LEFT JOIN pitcher_starts ps_away ON ps_away.game_id = g.game_id AND ps_away.pitcher_id = sp.away_sp_id
     WHERE
       g.home_runs IS NOT NULL AND g.away_runs IS NOT NULL
-      AND (ps_home.game_id IS NULL OR ps_away.game_id IS NULL)
     ORDER BY g.game_date, g.game_id;
     """
 
