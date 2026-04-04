@@ -37,6 +37,10 @@ case $SCRIPT in
   market_movement)
     python features/market_movement.py --date $TODAY
     ;;
+  update_scores)
+    python ingest/backfill_games.py --start $TODAY --end $TODAY
+    python export_to_bigquery.py --date $TODAY
+    ;;
   *)
     echo "Unknown script: $SCRIPT"
     exit 1

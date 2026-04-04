@@ -190,6 +190,7 @@ def main():
     LEFT JOIN pitcher_starts ps_away ON ps_away.game_id = g.game_id AND ps_away.pitcher_id = sp.away_sp_id
     WHERE
       g.home_runs IS NOT NULL AND g.away_runs IS NOT NULL
+      AND g.game_date >= CURRENT_DATE - INTERVAL '7 days'
     ORDER BY g.game_date, g.game_id;
     """
 

@@ -333,8 +333,11 @@ def compute_sp_recent_form(
     Compute ERA in last 3 starts, K/9 and WHIP in last 5 starts,
     and days since last start — all strictly before game_date.
     """
+    # Use league average ERA (4.50) as default instead of NaN/0
+    # This prevents null-fills-with-0 from making unknown pitchers look elite
+    LEAGUE_AVG_ERA = 4.50
     null = {
-        "era_last3":   np.nan,
+        "era_last3":   LEAGUE_AVG_ERA,
         "k9_last5":    np.nan,
         "whip_last5":  np.nan,
         "days_rest":   np.nan,
@@ -367,16 +370,25 @@ def compute_sp_recent_form(
     last_start = sp["game_date"].iloc[-1]
     null["days_rest"] = float((game_date - last_start).days)
 
-    # Last 3 starts ERA — require at least 9 IP to avoid spring training noise
+    # Last 3 starts ERA
     last3 = sp.tail(3)
     ip3   = last3["innings_pitched"].sum()
     ra3   = last3["runs_allowed"].sum()
-    if ip3 >= 9:
+    n3    = len(last3)
+    avg_ip_per_start = ip3 / n3 if n3 > 0 else 0
+
+    # Use league average if opener/reliever (avg < 2 IP/start or 0 total IP)
+    if ip3 == 0 or avg_ip_per_start < 2.0:
+        pass  # keep league average default (4.50)
+    elif ip3 >= 9:
         null["era_last3"] = float(ra3 / ip3 * 9)
     else:
         ip_all = sp["innings_pitched"].sum()
         ra_all = sp["runs_allowed"].sum()
-        if ip_all >= 30:
+        avg_ip_all = ip_all / len(sp) if len(sp) > 0 else 0
+        if avg_ip_all < 2.0:
+            pass  # opener/reliever — keep league average
+        elif ip_all >= 30:
             null["era_last3"] = float(ra_all / ip_all * 9)
 
     # Last 5 starts — need statcast for K and H+BB, so approximate from
