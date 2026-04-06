@@ -41,6 +41,11 @@ case $SCRIPT in
     python ingest/backfill_games.py --start $TODAY --end $TODAY
     python export_to_bigquery.py --date $TODAY
     ;;
+  morning_inference)
+    python features/build_features1.py --date $TODAY
+    python inference/inference.py --date $TODAY --team_model artifacts/runs_model_v8.txt --team_features artifacts/runs_model_v8_features.txt --no_calibrate --fill_missing
+    python export_to_bigquery.py --date $TODAY
+    ;;
   *)
     echo "Unknown script: $SCRIPT"
     exit 1

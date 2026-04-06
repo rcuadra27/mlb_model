@@ -177,7 +177,83 @@ function ordinal(n) {
 function isLiveStatus(status) {
   const s = (status || "").toLowerCase();
   if (s.includes("final") || s.includes("game over")) return false;
+  if (s.includes("completed early")) return false;
   return s.includes("progress") || s.includes("warmup") || s.includes("delayed") || s === "live";
+}
+
+/** True when the game is over (includes weather-shortened "Completed Early" and abstract Final). */
+function isMlbGameFinished(detailedState, abstractGameState, codedGameState) {
+  const abs = (abstractGameState || "").trim().toLowerCase();
+  if (abs === "final") return true;
+  const code = (codedGameState || "").trim().toUpperCase();
+  if (code === "F") return true;
+  const d = (detailedState || "").trim().toLowerCase();
+  if (d === "final" || d === "game over") return true;
+  if (d.includes("completed early")) return true;
+  if (d.includes("game over")) return true;
+  return false;
+}
+
+function isPostponedOrCancelled(detailedState, abstractGameState) {
+  const abs = (abstractGameState || "").trim().toLowerCase();
+  if (abs.includes("postponed")) return true;
+  const d = (detailedState || "").trim().toLowerCase();
+  return d.includes("postponed") || d.includes("cancelled") || d.includes("canceled");
+}
+
+/** Sort: live/upcoming first, then finals, postponed last. */
+function dashboardSortKey(g, liveMap) {
+  const lr = liveMap[g.game_id];
+  const detailed = lr?.status ?? g.status ?? "";
+  const abstract = lr?.abstractGameState ?? null;
+  const coded = lr?.codedGameState ?? null;
+  if (isPostponedOrCancelled(detailed, abstract)) return 2;
+  if (isMlbGameFinished(detailed, abstract, coded)) return 1;
+  return 0;
+}
+
+/**
+ * For finished games, prefer MLB schedule/linescore runs (official final).
+ * BigQuery `away_runs` / `home_runs` may be stale snapshots from during the game.
+ */
+function pickFinishedGameRuns(mlbLinescoreRuns, dbRuns) {
+  if (mlbLinescoreRuns != null && mlbLinescoreRuns !== "") {
+    const n = Number(mlbLinescoreRuns);
+    if (Number.isFinite(n)) return n;
+  }
+  if (dbRuns != null && dbRuns !== "") {
+    const n = Number(dbRuns);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function personName(personLike) {
+  if (!personLike || typeof personLike !== "object") return null;
+  return personLike.fullName || null;
+}
+
+/** balls-strikes, e.g. 2-1 */
+function formatPitchCount(balls, strikes) {
+  if (balls == null && strikes == null) return "—";
+  return `${balls ?? 0}-${strikes ?? 0}`;
+}
+
+function mergeLinescoreDetail(target, ls) {
+  if (!ls || !target) return;
+  const offense = ls.offense || {};
+  const defense = ls.defense || {};
+  const runnerOn = (base) => base != null && typeof base === "object" && base.id != null;
+  const bn = personName(offense.batter);
+  const pn = personName(defense.pitcher);
+  target.batterName = bn ?? target.batterName ?? null;
+  target.pitcherName = pn ?? target.pitcherName ?? null;
+  if (ls.balls != null) target.balls = Number(ls.balls);
+  if (ls.strikes != null) target.strikes = Number(ls.strikes);
+  if (ls.outs != null) target.outs = Number(ls.outs);
+  target.onFirst = runnerOn(offense.first);
+  target.onSecond = runnerOn(offense.second);
+  target.onThird = runnerOn(offense.third);
 }
 
 /** Pregame / warmup → season AVG; in progress or final → game scorecard line */
@@ -354,37 +430,60 @@ function RunsBarRow({ abbr, value, maxVal }) {
 function useLiveScores(dateStr) {
   const [map, setMap] = useState({});
 
-  const load = useCallback(() => {
+  const load = useCallback(async () => {
     const url = `${MLB_SCHEDULE}?sportId=1&date=${dateStr}&gameTypes=R&hydrate=linescore`;
-    fetch(url)
-      .then(r => r.json())
-      .then(data => {
-        const out = {};
-        for (const d of data.dates || []) {
-          for (const g of d.games || []) {
-            const pk = g.gamePk;
-            const ls = g.linescore;
-            const st = g.status?.detailedState || "";
-            const teams = ls?.teams;
-            const offense = ls?.offense || {};
-            const runnerOn = (base) => base != null && typeof base === "object" && base.id != null;
-            out[pk] = {
-              status: st,
-              awayRuns: teams?.away?.runs,
-              homeRuns: teams?.home?.runs,
-              currentInning: ls?.currentInning,
-              inningState: ls?.inningState,
-              venueName: g.venue?.name || g.venue?.default || null,
-              outs: ls?.outs != null ? Number(ls.outs) : null,
-              onFirst: runnerOn(offense.first),
-              onSecond: runnerOn(offense.second),
-              onThird: runnerOn(offense.third),
-            };
-          }
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      const out = {};
+      const livePks = [];
+      const runnerOn = (base) => base != null && typeof base === "object" && base.id != null;
+      for (const d of data.dates || []) {
+        for (const g of d.games || []) {
+          const pk = g.gamePk;
+          const ls = g.linescore;
+          const st = g.status?.detailedState || "";
+          const teams = ls?.teams;
+          const offense = ls?.offense || {};
+          const defense = ls?.defense || {};
+          out[pk] = {
+            status: st,
+            abstractGameState: g.status?.abstractGameState ?? null,
+            codedGameState: g.status?.codedGameState ?? null,
+            awayRuns: teams?.away?.runs,
+            homeRuns: teams?.home?.runs,
+            currentInning: ls?.currentInning,
+            inningState: ls?.inningState,
+            venueName: g.venue?.name || g.venue?.default || null,
+            outs: ls?.outs != null ? Number(ls.outs) : null,
+            onFirst: runnerOn(offense.first),
+            onSecond: runnerOn(offense.second),
+            onThird: runnerOn(offense.third),
+            batterName: personName(offense.batter),
+            pitcherName: personName(defense.pitcher),
+            balls: ls?.balls != null ? Number(ls.balls) : null,
+            strikes: ls?.strikes != null ? Number(ls.strikes) : null,
+          };
+          if (isLiveStatus(st)) livePks.push(pk);
         }
-        setMap(out);
-      })
-      .catch(() => {});
+      }
+      await Promise.all(
+        livePks.map(async (pk) => {
+          try {
+            const r = await fetch(`${MLB_BOX}/${pk}/linescore`);
+            if (!r.ok) return;
+            const j = await r.json();
+            const detailLs = j.linescore ?? j;
+            if (out[pk]) mergeLinescoreDetail(out[pk], detailLs);
+          } catch {
+            /* ignore */
+          }
+        }),
+      );
+      setMap(out);
+    } catch {
+      /* ignore */
+    }
   }, [dateStr]);
 
   useEffect(() => { load(); }, [load]);
@@ -901,9 +1000,13 @@ function OuRecommendationMark({ result }) {
 
 function GameCard({ g, live, enrich }) {
   const liveRow = live[g.game_id];
-  const mlbStatus = liveRow?.status || g.status;
-  const gameFinished = mlbStatus === "Final" || mlbStatus === "Game Over" || g.status === "Final" || g.status === "Game Over";
-  const gameLive = !gameFinished && (isLiveStatus(mlbStatus) || isLiveStatus(g.status));
+  const detailed = liveRow?.status ?? g.status ?? "";
+  const abstract = liveRow?.abstractGameState ?? null;
+  const coded = liveRow?.codedGameState ?? null;
+  const mlbStatus = detailed;
+  const gameFinished = isMlbGameFinished(detailed, abstract, coded);
+  const gamePostponed = isPostponedOrCancelled(detailed, abstract);
+  const gameLive = !gameFinished && !gamePostponed && (isLiveStatus(mlbStatus) || isLiveStatus(g.status));
   const liveMoneylines = useLiveMoneylines(g.away_team, g.home_team, gameLive);
 
   const morningH = g.morning_home_price ?? null;
@@ -938,10 +1041,14 @@ function GameCard({ g, live, enrich }) {
   const homeWins = g.p_win_home > g.p_win_away;
   const awayRunsLive = gameLive
     ? (liveRow?.awayRuns ?? 0)
-    : (gameFinished ? g.away_runs : null);
+    : (gameFinished
+      ? pickFinishedGameRuns(liveRow?.awayRuns, g.away_runs)
+      : null);
   const homeRunsLive = gameLive
     ? (liveRow?.homeRuns ?? 0)
-    : (gameFinished ? g.home_runs : null);
+    : (gameFinished
+      ? pickFinishedGameRuns(liveRow?.homeRuns, g.home_runs)
+      : null);
 
   let inningLabel = null;
   if (gameLive && liveRow?.currentInning && liveRow?.inningState) {
@@ -950,9 +1057,11 @@ function GameCard({ g, live, enrich }) {
 
   const ouRec = computeOU(g.total_runs_pred, ouDisplay ?? ouLineMorning);
 
+  const arFinal = pickFinishedGameRuns(liveRow?.awayRuns, g.away_runs);
+  const hrFinal = pickFinishedGameRuns(liveRow?.homeRuns, g.home_runs);
   const totalRunsActual =
-    gameFinished && g.away_runs != null && g.home_runs != null
-      ? Number(g.away_runs) + Number(g.home_runs)
+    gameFinished && arFinal != null && hrFinal != null && Number.isFinite(arFinal) && Number.isFinite(hrFinal)
+      ? arFinal + hrFinal
       : null;
   const ouLineForGrade = ouLineClosing ?? ouLineMorning ?? null;
   const ouResult = gameFinished ? gradeOuResult(ouRec, totalRunsActual, ouLineForGrade) : null;
@@ -995,15 +1104,36 @@ function GameCard({ g, live, enrich }) {
   return (
     <div style={{
       background: COL.card,
-      border: gameFinished ? "2px solid #000000" : `1px solid ${COL.border}`,
+      border: gamePostponed
+        ? "2px solid #D97706"
+        : gameFinished
+          ? "2px solid #000000"
+          : `1px solid ${COL.border}`,
       borderRadius: 16,
       marginBottom: 12,
       overflow: "hidden",
-      boxShadow: gameFinished
+      boxShadow: gameFinished || gamePostponed
         ? "0 2px 16px rgba(0,0,0,0.12)"
         : "0 2px 16px rgba(15,23,42,0.08)",
     }}>
-      {gameFinished && (
+      {gamePostponed && (
+        <div style={{
+          padding: "8px 16px",
+          background: "#F59E0B",
+          textAlign: "center",
+          borderBottom: "1px solid #D97706",
+        }}>
+          <span style={{
+            fontSize: 11,
+            fontWeight: 800,
+            color: "#FFFFFF",
+            letterSpacing: "0.16em",
+          }}>
+            POSTPONED
+          </span>
+        </div>
+      )}
+      {gameFinished && !gamePostponed && (
         <div style={{
           padding: "8px 16px",
           background: "#000000",
@@ -1018,6 +1148,11 @@ function GameCard({ g, live, enrich }) {
           }}>
             FINAL
           </span>
+          {mlbStatus && String(mlbStatus).toLowerCase().includes("completed early") && (
+            <div style={{ fontSize: 10, fontWeight: 600, color: "rgba(255,255,255,0.85)", marginTop: 4, letterSpacing: "0.04em" }}>
+              {mlbStatus}
+            </div>
+          )}
         </div>
       )}
       {gameLive && (
@@ -1042,28 +1177,59 @@ function GameCard({ g, live, enrich }) {
           </div>
           {liveRow && (
             <div style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 16,
               marginTop: 10,
               paddingTop: 10,
               borderTop: "1px solid rgba(220,38,38,0.15)",
-            }}>
-              <span style={{ fontSize: 12, fontWeight: 700, color: COL.text, fontVariantNumeric: "tabular-nums" }}>
-                {liveRow.outs != null ? `${liveRow.outs} out${liveRow.outs === 1 ? "" : "s"}` : "—"}
-              </span>
-              <BaseDiamond
-                onFirst={!!liveRow.onFirst}
-                onSecond={!!liveRow.onSecond}
-                onThird={!!liveRow.onThird}
-              />
+            }}
+            >
+              <div style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 16,
+                flexWrap: "wrap",
+              }}
+              >
+                <span style={{ fontSize: 12, fontWeight: 700, color: COL.text, fontVariantNumeric: "tabular-nums" }}>
+                  {liveRow.outs != null ? `${liveRow.outs} out${liveRow.outs === 1 ? "" : "s"}` : "—"}
+                </span>
+                <BaseDiamond
+                  onFirst={!!liveRow.onFirst}
+                  onSecond={!!liveRow.onSecond}
+                  onThird={!!liveRow.onThird}
+                />
+              </div>
+              <div style={{
+                marginTop: 10,
+                textAlign: "center",
+                fontSize: 11,
+                color: COL.text,
+                lineHeight: 1.55,
+                paddingLeft: 8,
+                paddingRight: 8,
+              }}
+              >
+                <div style={{ marginBottom: 4 }}>
+                  <span style={{ color: COL.textMuted, fontWeight: 700 }}>At bat </span>
+                  <span style={{ fontWeight: 600 }}>{liveRow.batterName ?? "—"}</span>
+                  <span style={{ color: COL.textMuted, margin: "0 10px" }}>·</span>
+                  <span style={{ color: COL.textMuted, fontWeight: 700 }}>Pitching </span>
+                  <span style={{ fontWeight: 600 }}>{liveRow.pitcherName ?? "—"}</span>
+                </div>
+                <div>
+                  <span style={{ color: COL.textMuted, fontWeight: 700 }}>Count </span>
+                  <span style={{ fontWeight: 700, fontVariantNumeric: "tabular-nums", color: COL.textSecondary }}>
+                    {formatPitchCount(liveRow.balls, liveRow.strikes)}
+                  </span>
+                  <span style={{ color: COL.textMuted, fontSize: 10, marginLeft: 6 }}>balls-strikes</span>
+                </div>
+              </div>
             </div>
           )}
         </div>
       )}
 
-      {firstPitch && !gameFinished && !gameLive && (
+      {firstPitch && !gameFinished && !gameLive && !gamePostponed && (
         <div style={{ padding: "6px 16px 0", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
           <span style={{ fontSize: 10, color: COL.textMuted, fontWeight: 600, letterSpacing: "0.05em" }}>⚾ FIRST PITCH</span>
           <span style={{ fontSize: 11, color: COL.model, fontWeight: 600 }}>{firstPitch}</span>
@@ -1259,9 +1425,27 @@ export default function App() {
   const live = useLiveScores(date);
 
   const needsBoxscorePoll = useMemo(() => games.some(g => {
-    const st = (live[g.game_id]?.status || g.status || "").toLowerCase();
+    const lr = live[g.game_id];
+    const detailed = lr?.status ?? g.status ?? "";
+    const abstract = lr?.abstractGameState ?? null;
+    const coded = lr?.codedGameState ?? null;
+    if (isPostponedOrCancelled(detailed, abstract)) return false;
+    if (isMlbGameFinished(detailed, abstract, coded)) return false;
+    const st = detailed.toLowerCase();
     return st.includes("progress") || st === "live" || st.includes("in progress");
   }), [games, live]);
+
+  const sortedGames = useMemo(() => {
+    if (!games.length) return [];
+    return [...games].sort((a, b) => {
+      const ka = dashboardSortKey(a, live);
+      const kb = dashboardSortKey(b, live);
+      if (ka !== kb) return ka - kb;
+      const ta = a.first_pitch_utc ? new Date(a.first_pitch_utc).getTime() : 0;
+      const tb = b.first_pitch_utc ? new Date(b.first_pitch_utc).getTime() : 0;
+      return ta - tb;
+    });
+  }, [games, live]);
 
   const [boxRefresh, setBoxRefresh] = useState(0);
   useEffect(() => {
@@ -1332,9 +1516,7 @@ export default function App() {
           ? <p style={{ color: COL.textSecondary, fontSize: 14, textAlign: "center", marginTop: "3rem" }}>Loading games...</p>
           : games.length === 0
           ? <p style={{ color: COL.textSecondary, fontSize: 14, textAlign: "center", marginTop: "3rem" }}>No games found for {date}</p>
-          : [...games.filter(g => g.status !== "Final" && g.status !== "Game Over"),
-               ...games.filter(g => g.status === "Final" || g.status === "Game Over")]
-            .map(g => <GameCard key={g.game_id} g={g} live={live} enrich={enrich} />)
+          : sortedGames.map(g => <GameCard key={g.game_id} g={g} live={live} enrich={enrich} />)
         }
 
         <div style={{ textAlign: "center", padding: "24px 16px 8px", marginTop: 8 }}>
