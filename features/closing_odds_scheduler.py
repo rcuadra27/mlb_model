@@ -34,8 +34,11 @@ ODDS_API_SPORT = "baseball_mlb"
 PT             = pytz.timezone("America/Los_Angeles")
 
 CLOSING_WINDOW_MINUTES = 75
-POLL_INTERVAL_SECONDS  = 300
+# Default 10 min: each GET /odds costs ~1 credit; 5 min × many hours adds up fast.
+POLL_INTERVAL_SECONDS  = 900
 MAX_RUNTIME_HOURS      = 8
+# When only waiting for the next T−closing_window pull, cap nap (still wake periodically).
+MAX_NAP_SECONDS        = 1800
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +49,42 @@ def american_to_implied(price: float) -> float:
     if price < 0:
         return abs(price) / (abs(price) + 100.0)
     return 100.0 / (price + 100.0)
+
+
+def sleep_seconds_until_next_closing_pull(
+    now_utc: datetime,
+    games: pd.DataFrame,
+    pulled: set,
+    morning_done: set,
+    first_poll: bool,
+    poll_interval: int,
+    closing_window_minutes: int,
+    max_nap_seconds: int = MAX_NAP_SECONDS,
+) -> int:
+    """
+    Reduce Odds API usage: after morning lines are stored, avoid polling every poll_interval
+    while all remaining games are still far from the closing window.
+    """
+    if first_poll:
+        return poll_interval
+    if len(morning_done) < len(games):
+        return poll_interval
+    deadlines: list[datetime] = []
+    for _, g in games.iterrows():
+        if int(g["game_id"]) in pulled:
+            continue
+        fp = g["first_pitch_utc"]
+        if pd.isna(fp):
+            return poll_interval
+        close_at = fp - timedelta(minutes=closing_window_minutes)
+        deadlines.append(close_at)
+    if not deadlines:
+        return poll_interval
+    next_close = min(deadlines)
+    sec = (next_close - now_utc).total_seconds() - 90
+    if sec <= poll_interval:
+        return poll_interval
+    return int(min(max(sec, poll_interval), max_nap_seconds))
 
 
 def vig_free_prob(home_price: float, away_price: float) -> tuple[float, float]:
@@ -303,12 +342,14 @@ def get_games_with_first_pitch(engine, schema: str, date_str: str) -> pd.DataFra
 # ---------------------------------------------------------------------------
 
 def run_scheduler(engine, schema: str, date_str: str, api_key: str,
-                  model_path: str, features_path: str) -> None:
+                  model_path: str, features_path: str,
+                  poll_interval: int = POLL_INTERVAL_SECONDS,
+                  closing_window_minutes: int = CLOSING_WINDOW_MINUTES) -> None:
 
     print(f"\n{'='*60}")
     print(f"  Closing Odds Scheduler — {date_str}")
-    print(f"  Pulling odds {CLOSING_WINDOW_MINUTES} min before first pitch")
-    print(f"  Polling every {POLL_INTERVAL_SECONDS}s")
+    print(f"  Pulling odds {closing_window_minutes} min before first pitch")
+    print(f"  Base poll interval {poll_interval}s (longer naps when only waiting on clock)")
     print(f"{'='*60}\n")
 
     games         = get_games_with_first_pitch(engine, schema, date_str)
@@ -350,8 +391,9 @@ def run_scheduler(engine, schema: str, date_str: str, api_key: str,
         df_odds = fetch_all_odds(api_key)
 
         if df_odds.empty:
-            print(f"    No odds returned — will retry in {POLL_INTERVAL_SECONDS}s")
-            time.sleep(POLL_INTERVAL_SECONDS)
+            err_sleep = min(max(poll_interval * 2, 600), 3600)
+            print(f"    No odds returned — will retry in {err_sleep}s")
+            time.sleep(err_sleep)
             continue
 
         newly_pulled = []
@@ -378,7 +420,7 @@ def run_scheduler(engine, schema: str, date_str: str, api_key: str,
                 should_pull = True
             else:
                 minutes_to_game = (fp_utc - now_utc).total_seconds() / 60
-                if minutes_to_game <= CLOSING_WINDOW_MINUTES:
+                if minutes_to_game <= closing_window_minutes:
                     should_pull = True
                     print(f"    {game['away_team']} @ {game['home_team']}: "
                           f"{minutes_to_game:.0f} min to first pitch — pulling closing odds")
@@ -399,8 +441,6 @@ def run_scheduler(engine, schema: str, date_str: str, api_key: str,
             pulled.add(game_id)
             newly_pulled.append(game_id)
 
-        first_poll = False
-
         if newly_pulled:
             rerun_inference(date_str, model_path, features_path)
 
@@ -408,8 +448,13 @@ def run_scheduler(engine, schema: str, date_str: str, api_key: str,
             print(f"\n  [{now_pt_str}] All {len(games)} games processed ✓")
             break
 
-        print(f"    Sleeping {POLL_INTERVAL_SECONDS}s...\n")
-        time.sleep(POLL_INTERVAL_SECONDS)
+        nap = sleep_seconds_until_next_closing_pull(
+            now_utc, games, pulled, morning_done, first_poll,
+            poll_interval, closing_window_minutes,
+        )
+        first_poll = False
+        print(f"    Sleeping {nap}s...\n")
+        time.sleep(nap)
 
     print("\n  Scheduler finished.")
 
@@ -439,12 +484,14 @@ def main():
     engine = create_engine(pg_dsn, pool_pre_ping=True)
 
     run_scheduler(
-        engine        = engine,
-        schema        = args.schema,
-        date_str      = args.date,
-        api_key       = api_key,
-        model_path    = args.model,
-        features_path = args.features,
+        engine                 = engine,
+        schema                 = args.schema,
+        date_str               = args.date,
+        api_key                = api_key,
+        model_path             = args.model,
+        features_path          = args.features,
+        poll_interval          = args.poll_interval,
+        closing_window_minutes = args.minutes_before,
     )
 
 

@@ -1,0 +1,1 @@
+as_of_ts,game_id,game_date,home_team,away_team,home_runs_pred,away_runs_pred,total_runs_pred,run_diff_pred,p_home_win_poisson,p_home_model,home_runs_actual,away_runs_actual,home_win_actual,p_home_win_pred,total_runs_actual,home_win_actual_int,predicted_home_win

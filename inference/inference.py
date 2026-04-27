@@ -48,7 +48,10 @@ WEATHER_FEATURES = [
 
 NAN_PASSTHROUGH_FEATURES = WEATHER_FEATURES + [
     "sp_ra9_diff", "sp_ip_diff",
-    "sp_era_last3_diff", "sp_k9_last5_diff", "sp_days_rest_diff",
+    "sp_era_last3_diff", "sp_era_last5_diff", "sp_era_season_diff",
+    "sp_whip_last5_diff",
+    "sp_k9_last5_diff", "sp_days_rest_diff",
+    "sp_pitches_last_start_diff", "sp_innings_season_diff",
     "sp_xwoba_against_diff", "sp_k_rate_diff", "sp_bb_rate_diff",
     "sp_gb_rate_diff", "sp_n_pa_diff",
     "lineup_xwoba_diff", "lineup_k_rate_diff", "lineup_bb_rate_diff",
@@ -57,33 +60,46 @@ NAN_PASSTHROUGH_FEATURES = WEATHER_FEATURES + [
     "runs_for_7d_diff", "runs_for_15d_diff",
     "runs_against_7d_diff", "runs_against_15d_diff",
     "win_pct_7d_diff", "win_pct_15d_diff",
+    "win_streak_diff", "days_since_last_game_diff",
     "total_offense_env", "total_defense_env",
     "park_runs_factor_blended",
-    "league_avg_runs_60d"
+    "league_avg_runs_60d",
+    "umpire_runs_boost", "umpire_n_games",
+    "umpire_k_rate_boost", "umpire_bb_rate_boost",
+    "line_move_magnitude",
 ]
+
 DROP_SUBSTRINGS = [
     "price", "_pred", "p_home", "p_away", "p_tie",
     "p_home_win", "p_home_median", "p_home_blend", "n_books",
 ]
 
 GAME_LEVEL_DIFF_COLS = [
-    # existing
     "sp_ra9_diff", "sp_ip_diff",
-    "bp_outs_3d_diff", "bp_hlev_3d_diff", "bp_b2b_diff",
+    "bp_outs_1d_diff",
+    "bp_outs_3d_diff",
+    "bp_outs_5d_diff",
+    "bp_hlev_outs_1d_diff",
+    "bp_hlev_3d_diff",
+    "bp_b2b_diff",
     "win_pct_diff", "runs_for_diff", "runs_against_diff",
     "avg_runs_scored_60_diff", "avg_runs_allowed_60_diff",
+    "runs_for_7d_diff", "runs_for_15d_diff",
+    "runs_against_7d_diff", "runs_against_15d_diff",
+    "win_pct_7d_diff", "win_pct_15d_diff",
+    "win_streak_diff", "days_since_last_game_diff",
+    "sp_era_last3_diff", "sp_era_last5_diff", "sp_era_season_diff",
+    "sp_whip_last5_diff",
+    "sp_k9_last5_diff", "sp_days_rest_diff",
+    "sp_pitches_last_start_diff", "sp_innings_season_diff",
     "matchup_diff",
     "sp_xwoba_against_diff", "sp_k_rate_diff", "sp_bb_rate_diff",
     "sp_gb_rate_diff", "sp_n_pa_diff",
     "lineup_xwoba_diff", "lineup_k_rate_diff", "lineup_bb_rate_diff",
     "lineup_n_pa_diff", "lineup_vs_sp_score_diff",
-    # NEW — must match train_runs_model.py exactly
-    "runs_for_7d_diff", "runs_for_15d_diff",
-    "runs_against_7d_diff", "runs_against_15d_diff",
-    "win_pct_7d_diff", "win_pct_15d_diff",
-    "sp_era_last3_diff", "sp_k9_last5_diff", "sp_days_rest_diff",
     "lineup_barrel_rate_diff", "lineup_hard_hit_rate_diff",
 ]
+
 ODDS_API_SPORT = "baseball_mlb"
 
 # Added to clipped model outputs (inference only). Fitted on 2024 held-out data (n=2374 games).
@@ -196,8 +212,16 @@ def add_game_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
     add_diff("win_pct_15d_diff",      "home_win_pct_15d",      "away_win_pct_15d")
     # SP recent form
     add_diff("sp_era_last3_diff",     "home_sp_era_last3",     "away_sp_era_last3")
-    add_diff("sp_k9_last5_diff",      "home_sp_k9_last5",      "away_sp_k9_last5")
-    add_diff("sp_days_rest_diff",     "home_sp_days_rest",     "away_sp_days_rest")
+    add_diff("sp_era_last5_diff",          "home_sp_era_last5",          "away_sp_era_last5")
+    add_diff("sp_era_season_diff",         "home_sp_era_season",         "away_sp_era_season")
+    add_diff("sp_whip_last5_diff",         "home_sp_whip_last5",         "away_sp_whip_last5")
+    add_diff("sp_pitches_last_start_diff", "home_sp_pitches_last_start", "away_sp_pitches_last_start")
+    add_diff("sp_innings_season_diff",     "home_sp_innings_season",     "away_sp_innings_season")
+    add_diff("win_streak_diff",            "home_win_streak",            "away_win_streak")
+    add_diff("days_since_last_game_diff",  "home_days_since_last_game",  "away_days_since_last_game")
+    add_diff("bp_outs_1d_diff",            "home_bp_outs_1d",            "away_bp_outs_1d")
+    add_diff("bp_outs_5d_diff",            "home_bp_outs_5d",            "away_bp_outs_5d")
+    add_diff("bp_hlev_outs_1d_diff",       "home_bp_hlev_outs_1d",       "away_bp_hlev_outs_1d")
     # Lineup power
     add_diff("lineup_barrel_rate_diff",   "home_lineup_barrel_rate_90",   "away_lineup_barrel_rate_90")
     add_diff("lineup_hard_hit_rate_diff", "home_lineup_hard_hit_rate_90", "away_lineup_hard_hit_rate_90")
@@ -336,15 +360,15 @@ def fetch_games_and_features(engine, schema: str, date_str: str) -> pd.DataFrame
                gw.temp_f AS gw_temp_f, gw.wind_mph AS gw_wind_mph,
                gw.wind_dir_deg AS gw_wind_dir_deg,
                gw.humidity AS gw_humidity, gw.precip_in AS gw_precip_in
-        FROM {schema}.games g
+      FROM {schema}.games g
         JOIN {schema}.features_game f ON f.game_id = g.game_id
         LEFT JOIN {schema}.teams th ON th.mlb_team_id = g.home_team_id
         LEFT JOIN {schema}.teams ta ON ta.mlb_team_id = g.away_team_id
         LEFT JOIN {schema}.game_starting_pitchers gsp ON gsp.game_id = g.game_id
         LEFT JOIN {schema}.game_weather gw ON gw.game_id = g.game_id
-        WHERE g.game_date = :d
-        ORDER BY g.game_id
-    """) 
+      WHERE g.game_date = :d
+      ORDER BY g.game_id
+    """)
     df = pd.read_sql(q, engine, params={"d": date_str})
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
@@ -369,7 +393,6 @@ def fetch_games_and_features(engine, schema: str, date_str: str) -> pd.DataFrame
 
     if "season" not in df.columns:
         df["season"] = pd.to_datetime(df["game_date"]).dt.year
-
     return df
 
 
@@ -810,8 +833,8 @@ def main():
     league_baseline = df["league_avg_runs_60d"].fillna(TRAINING_LEAGUE_MEAN).values
 
     # Step 3: add baseline back to get actual run predictions
-    df["home_runs_pred"] = np.clip(home_residuals + league_baseline, 0.1, None)
-    df["away_runs_pred"] = np.clip(away_residuals + league_baseline, 0.1, None)
+    df["home_runs_pred"] = np.clip(home_residuals + league_baseline, 2.5, None)
+    df["away_runs_pred"] = np.clip(away_residuals + league_baseline, 2.5, None)
     df["total_runs_pred"] = df["home_runs_pred"] + df["away_runs_pred"]
     df["run_diff_pred"]   = df["home_runs_pred"] - df["away_runs_pred"]
 
@@ -909,6 +932,10 @@ def main():
         conn.execute(text(f"""
             INSERT INTO {args.schema}.inference_game_predictions ({col_names})
             SELECT {col_names} FROM {args.schema}.{tmp}
+            WHERE game_id NOT IN (
+                SELECT game_id FROM {args.schema}.games
+                WHERE LOWER(COALESCE(status, '')) IN ('final', 'game over', 'completed early')
+            )
             ON CONFLICT (as_of_ts, game_id) DO UPDATE SET {set_clause}
         """))
         conn.execute(text(f"DROP TABLE IF EXISTS {args.schema}.{tmp}"))

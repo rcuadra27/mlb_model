@@ -28,7 +28,12 @@ def main():
     ap.add_argument("--end_season", type=int, required=True)
     args = ap.parse_args()
 
-    conn = psycopg2.connect(args.pg_dsn)
+    dsn = args.pg_dsn
+    if dsn and dsn.startswith("postgresql+psycopg2://"):
+        dsn = "postgresql://" + dsn[len("postgresql+psycopg2://"):]
+    elif dsn and dsn.startswith("postgres+psycopg2://"):
+        dsn = "postgres://" + dsn[len("postgres+psycopg2://"):]
+    conn = psycopg2.connect(dsn)
     session = requests.Session()
 
     updates = []

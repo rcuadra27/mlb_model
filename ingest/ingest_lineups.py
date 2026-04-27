@@ -39,8 +39,8 @@ MAX_RUNTIME_HOURS    = 16    # safety cutoff — covers all games including late
 MLB_BOXSCORE_URL     = "https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
 MLB_SCHEDULE_URL     = "https://statsapi.mlb.com/api/v1/schedule"
 
-MODEL_PATH    = "artifacts/runs_model_v8.txt"
-FEATURES_PATH = "artifacts/runs_model_v8_features.txt"
+MODEL_PATH    = "artifacts/runs_model_v9.joblib"
+FEATURES_PATH = "artifacts/runs_model_v9_features.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +188,23 @@ def run_inference_chain(date_str: str, schema: str) -> None:
             "cmd": [
                 sys.executable, "features/build_features1.py",
                 "--date", date_str,
+                "--schema", schema,
+            ]
+        },
+        {
+            "name": "build_pitchmix_rolling",
+            "cmd": [
+                sys.executable, "features/build_pitchmix_rolling.py",
+                "--date", date_str,
+                "--schema", schema,
+            ]
+        },
+        {
+            "name": "build_lineup_matchups",
+            "cmd": [
+                sys.executable, "features/build_lineup_matchups.py",
+                "--start", date_str,
+                "--end", date_str,
                 "--schema", schema,
             ]
         },

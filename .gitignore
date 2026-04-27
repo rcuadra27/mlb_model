@@ -13,6 +13,7 @@ ENV/
 # artifacts/*.joblib
 
 # IDE
+.claude/
 .vscode/
 .idea/
 *.swp
@@ -56,3 +57,4 @@ dashboard/node_modules/
 # GCP credentials
 *.json
 service_account*.json
+dashboard/.env

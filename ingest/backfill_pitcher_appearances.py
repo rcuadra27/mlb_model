@@ -176,7 +176,12 @@ def main():
     if not args.pg_dsn:
         raise SystemExit("Missing --pg_dsn and $PG_DSN is not set")
 
-    conn = psycopg2.connect(args.pg_dsn)
+    dsn = args.pg_dsn
+    if dsn.startswith("postgresql+psycopg2://"):
+        dsn = "postgresql://" + dsn[len("postgresql+psycopg2://"):]
+    elif dsn.startswith("postgres+psycopg2://"):
+        dsn = "postgres://" + dsn[len("postgres+psycopg2://"):]
+    conn = psycopg2.connect(dsn)
 
     # Only completed games; join starters so we can mark is_starter
     q = """

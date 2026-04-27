@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """
-train_runs_model.py
+train_runs_model.py  — v9
 
-Trains a LightGBM Tweedie regressor to predict team runs scored per game.
+Trains a LightGBM regressor to predict team runs scored per game.
 Two rows per game (home + away). Game-level diff features (home - away) are
 FLIPPED for the away row so every row's features are team-vs-opponent, not
 always home-vs-away.
+
+v9 additions vs v8:
+  - sp_era_last5_diff, sp_era_season_diff   — SP ERA multi-window
+  - sp_whip_last5_diff                      — SP WHIP (now real, not null)
+  - sp_pitches_last_start_diff              — SP workload signal
+  - sp_innings_season_diff                  — SP season workload
+  - win_streak_diff                         — team momentum
+  - days_since_last_game_diff               — rest/travel signal
+  - line_move_magnitude                     — sharp money signal
+  - sharp_action_home                       — sharp side indicator
+  - umpire_k_rate_boost                     — umpire strikeout tendency
+  - umpire_bb_rate_boost                    — umpire walk tendency
+  - bp_outs_1d_diff, bp_outs_5d_diff        — bullpen workload expanded
+  - bp_hlev_outs_1d_diff                    — high-leverage bp yesterday
 """
 
 import os
@@ -41,26 +55,34 @@ DROP_SUBSTRINGS = [
 
 LOCKED_FEATURES = [
     # ── Team strength — multiple windows ──────────────────────────────────
-    "win_pct_diff",          # 30d
-    "runs_for_diff",         # 30d
-    "runs_against_diff",     # 30d
+    "win_pct_diff",
+    "runs_for_diff",
+    "runs_against_diff",
     "avg_runs_scored_60_diff",
     "avg_runs_allowed_60_diff",
-    "runs_for_7d_diff",      # short-window momentum
+    "runs_for_7d_diff",
     "runs_for_15d_diff",
     "runs_against_7d_diff",
     "runs_against_15d_diff",
     "win_pct_7d_diff",
     "win_pct_15d_diff",
-    # ── Absolute scoring environment (both teams combined) ────────────────
-    "total_offense_env",     # home_scored_60 + away_scored_60 — captures high-total games
-    "total_defense_env",     # home_allowed_60 + away_allowed_60
+    # ── Team situational [NEW] ────────────────────────────────────────────
+    "win_streak_diff",
+    "days_since_last_game_diff",
+    # ── Absolute scoring environment ──────────────────────────────────────
+    "total_offense_env",
+    "total_defense_env",
     # ── Starting pitcher — legacy ─────────────────────────────────────────
     "sp_ra9_diff",
     "sp_ip_diff",
-    "sp_era_last3_diff",     # ERA in last 3 starts — captures recent form
-    "sp_k9_last5_diff",      # K/9 in last 5 starts
-    "sp_days_rest_diff",     # rest days advantage
+    "sp_era_last3_diff",
+    "sp_era_last5_diff",        # NEW
+    "sp_era_season_diff",       # NEW
+    "sp_whip_last5_diff",       # NEW — now real
+    "sp_k9_last5_diff",
+    "sp_days_rest_diff",
+    "sp_pitches_last_start_diff",  # NEW
+    "sp_innings_season_diff",      # NEW
     # ── Starting pitcher — statcast 90d ───────────────────────────────────
     "sp_xwoba_against_diff",
     "sp_k_rate_diff",
@@ -68,7 +90,10 @@ LOCKED_FEATURES = [
     "sp_gb_rate_diff",
     "sp_n_pa_diff",
     # ── Bullpen fatigue ───────────────────────────────────────────────────
+    "bp_outs_1d_diff",          # NEW
     "bp_outs_3d_diff",
+    "bp_outs_5d_diff",          # NEW
+    "bp_hlev_outs_1d_diff",     # NEW
     "bp_hlev_3d_diff",
     "bp_b2b_diff",
     # ── Lineup quality — statcast 90d ────────────────────────────────────
@@ -76,7 +101,7 @@ LOCKED_FEATURES = [
     "lineup_k_rate_diff",
     "lineup_bb_rate_diff",
     "lineup_n_pa_diff",
-    "lineup_barrel_rate_diff",    # raw power — key for high-total games
+    "lineup_barrel_rate_diff",
     "lineup_hard_hit_rate_diff",
     # ── Matchup ───────────────────────────────────────────────────────────
     "lineup_skill_diff",
@@ -87,75 +112,95 @@ LOCKED_FEATURES = [
     # ── Context ───────────────────────────────────────────────────────────
     "is_home",
     # ── Park factors ──────────────────────────────────────────────────────
-    "park_runs_factor",          # prior-season 3yr average
-    "park_runs_factor_blended",  # blend of prior + current season (updates weekly)
-    # ── Weather — NaN passthrough ─────────────────────────────────────────
+    "park_runs_factor",
+    "park_runs_factor_blended",
+    # ── Weather ───────────────────────────────────────────────────────────
     "temp_f",
     "wind_mph",
     "wind_dir_sin",
     "wind_dir_cos",
     "humidity",
     "precip_in",
-    #Umpire
-    "umpire_runs_boost",    # umpire's historical runs/game vs league avg
-    "umpire_n_games",       # sample size signal
+    # ── Umpire ────────────────────────────────────────────────────────────
+    "umpire_runs_boost",
+    "umpire_n_games",
+    "umpire_k_rate_boost",      # NEW
+    "umpire_bb_rate_boost",     # NEW
+    # ── Market signals ────────────────────────────────────────────────────
+    "line_move_magnitude",      # NEW
+    "sharp_action_home",        # NEW
 ]
 
-# LightGBM handles NaN natively for these — do NOT impute with zero or median.
 WEATHER_FEATURES = [
     "temp_f", "wind_mph", "wind_dir_sin", "wind_dir_cos",
     "humidity", "precip_in",
 ]
 
-# Also pass statcast features through as NaN — sparse early in careers/season.
 NAN_PASSTHROUGH_FEATURES = WEATHER_FEATURES + [
-    # SP legacy — missing when pitcher unknown or no start history
+    # SP legacy
     "sp_ra9_diff", "sp_ip_diff",
-    "sp_era_last3_diff", "sp_k9_last5_diff", "sp_days_rest_diff",
+    "sp_era_last3_diff", "sp_era_last5_diff", "sp_era_season_diff",
+    "sp_whip_last5_diff",
+    "sp_k9_last5_diff", "sp_days_rest_diff",
+    "sp_pitches_last_start_diff", "sp_innings_season_diff",
     # SP statcast
     "sp_xwoba_against_diff", "sp_k_rate_diff", "sp_bb_rate_diff",
     "sp_gb_rate_diff", "sp_n_pa_diff",
-    # Lineup statcast — sparse early in season / careers
+    # Lineup statcast
     "lineup_xwoba_diff", "lineup_k_rate_diff", "lineup_bb_rate_diff",
     "lineup_n_pa_diff", "lineup_vs_sp_score_diff",
     "lineup_barrel_rate_diff", "lineup_hard_hit_rate_diff",
-    # Short-window team stats — missing early in season
+    # Short-window team stats
     "runs_for_7d_diff", "runs_for_15d_diff",
     "runs_against_7d_diff", "runs_against_15d_diff",
     "win_pct_7d_diff", "win_pct_15d_diff",
-    # Scoring environment — missing when 60d cols missing
+    # Team situational
+    "win_streak_diff", "days_since_last_game_diff",
+    # Scoring environment
     "total_offense_env", "total_defense_env",
-    # Blended park factor — missing until enough current-season games
+    # Park factor
     "park_runs_factor_blended",
-    "umpire_runs_boost",    # null for new umpires or missing assignments
-    "umpire_n_games",
+    # Umpire
+    "umpire_runs_boost", "umpire_n_games",
+    "umpire_k_rate_boost", "umpire_bb_rate_boost",
+    # Market
+    "line_move_magnitude",
 ]
 
-# Computed as (home - away) at game level.
-# Negated for the away team row so they read (team - opponent).
 GAME_LEVEL_DIFF_COLS = [
-    # Team strength diffs
+    # Team strength
     "sp_ra9_diff", "sp_ip_diff",
-    "bp_outs_3d_diff", "bp_hlev_3d_diff", "bp_b2b_diff",
+    "bp_outs_1d_diff",          # NEW
+    "bp_outs_3d_diff",
+    "bp_outs_5d_diff",          # NEW
+    "bp_hlev_outs_1d_diff",     # NEW
+    "bp_hlev_3d_diff",
+    "bp_b2b_diff",
     "win_pct_diff", "runs_for_diff", "runs_against_diff",
     "avg_runs_scored_60_diff", "avg_runs_allowed_60_diff",
-    # Short-window diffs
+    # Short-window
     "runs_for_7d_diff", "runs_for_15d_diff",
     "runs_against_7d_diff", "runs_against_15d_diff",
     "win_pct_7d_diff", "win_pct_15d_diff",
-    # SP recent form diffs
-    "sp_era_last3_diff", "sp_k9_last5_diff", "sp_days_rest_diff",
-    # Matchup (precomputed home-away)
+    # Team situational
+    "win_streak_diff",
+    "days_since_last_game_diff",
+    # SP recent form
+    "sp_era_last3_diff", "sp_era_last5_diff", "sp_era_season_diff",
+    "sp_whip_last5_diff",
+    "sp_k9_last5_diff", "sp_days_rest_diff",
+    "sp_pitches_last_start_diff", "sp_innings_season_diff",
+    # Matchup
     "matchup_diff",
-    # Statcast SP diffs
+    # Statcast SP
     "sp_xwoba_against_diff", "sp_k_rate_diff", "sp_bb_rate_diff",
     "sp_gb_rate_diff", "sp_n_pa_diff",
-    # Statcast lineup diffs
+    # Statcast lineup
     "lineup_xwoba_diff", "lineup_k_rate_diff", "lineup_bb_rate_diff",
     "lineup_n_pa_diff", "lineup_vs_sp_score_diff",
     "lineup_barrel_rate_diff", "lineup_hard_hit_rate_diff",
-    # NOTE: total_offense_env, total_defense_env, park factors are NOT diffs —
-    # they are global game-level features, same for both team rows. Do NOT flip.
+    # NOTE: total_offense_env, total_defense_env, park factors, market
+    # features are global — NOT diffs. Do NOT flip for away rows.
 ]
 
 
@@ -185,7 +230,6 @@ def load_base(engine, schema: str) -> pd.DataFrame:
     )
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    # Prefer game_weather values; fall back to whatever features_game stored.
     weather_map = {
         "temp_f":       "weather_temp_f",
         "wind_mph":     "weather_wind_mph",
@@ -223,27 +267,31 @@ def drop_leaky(cols):
 
 
 def add_game_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute game-level diff features (home - away) on the raw game frame
-    before splitting into team rows. Flipped for away rows in build_two_row_dataset.
-    """
     out = df.copy()
 
     def add_diff(new_col, home_col, away_col):
         if home_col in out.columns and away_col in out.columns:
             out[new_col] = out[home_col].astype(float) - out[away_col].astype(float)
 
+    # Legacy SP
     add_diff("sp_ra9_diff",              "home_sp_ra9_last5",          "away_sp_ra9_last5")
     add_diff("sp_ip_diff",               "home_sp_ip_per_start_last5", "away_sp_ip_per_start_last5")
+
+    # Bullpen
+    add_diff("bp_outs_1d_diff",          "home_bp_outs_1d",            "away_bp_outs_1d")
     add_diff("bp_outs_3d_diff",          "home_bp_outs_3d",            "away_bp_outs_3d")
+    add_diff("bp_outs_5d_diff",          "home_bp_outs_5d",            "away_bp_outs_5d")
+    add_diff("bp_hlev_outs_1d_diff",     "home_bp_hlev_outs_1d",       "away_bp_hlev_outs_1d")
     add_diff("bp_hlev_3d_diff",          "home_bp_hlev_outs_3d",       "away_bp_hlev_outs_3d")
+
+    # Team strength
     add_diff("win_pct_diff",             "home_win_pct_30",             "away_win_pct_30")
     add_diff("runs_for_diff",            "home_runs_for_30",            "away_runs_for_30")
     add_diff("runs_against_diff",        "home_runs_against_30",        "away_runs_against_30")
     add_diff("avg_runs_scored_60_diff",  "home_avg_runs_scored_60",     "away_avg_runs_scored_60")
     add_diff("avg_runs_allowed_60_diff", "home_avg_runs_allowed_60",    "away_avg_runs_allowed_60")
 
-    # bp_b2b: try column name variants in order of preference
+    # bp_b2b
     for h, a in [
         ("home_bp_b2b_pitchers_3d", "away_bp_b2b_pitchers_3d"),
         ("home_bp_b2b",             "away_bp_b2b"),
@@ -252,48 +300,48 @@ def add_game_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
         if h in out.columns and a in out.columns:
             out["bp_b2b_diff"] = out[h].astype(float) - out[a].astype(float)
             break
-
     if "bp_b2b_diff" in out.columns:
         out["bp_b2b_diff"] = out["bp_b2b_diff"].fillna(0.0)
 
-    # matchup_diff, lineup_*_vs_sp, and statcast SP/lineup diffs are all
-    # precomputed in features_game by build_features.py as (home - away).
-    # They pass through as global columns and get flipped for away rows.
+    # Short-window team stats
+    add_diff("runs_for_7d_diff",      "home_runs_for_7d",      "away_runs_for_7d")
+    add_diff("runs_for_15d_diff",     "home_runs_for_15d",     "away_runs_for_15d")
+    add_diff("runs_against_7d_diff",  "home_runs_against_7d",  "away_runs_against_7d")
+    add_diff("runs_against_15d_diff", "home_runs_against_15d", "away_runs_against_15d")
+    add_diff("win_pct_7d_diff",       "home_win_pct_7d",       "away_win_pct_7d")
+    add_diff("win_pct_15d_diff",      "home_win_pct_15d",      "away_win_pct_15d")
 
-    # New statcast diff features (materialised by build_features.py)
+    # Team situational [NEW]
+    add_diff("win_streak_diff",            "home_win_streak",            "away_win_streak")
+    add_diff("days_since_last_game_diff",  "home_days_since_last_game",  "away_days_since_last_game")
+
+    # SP recent form
+    add_diff("sp_era_last3_diff",          "home_sp_era_last3",          "away_sp_era_last3")
+    add_diff("sp_era_last5_diff",          "home_sp_era_last5",          "away_sp_era_last5")   # NEW
+    add_diff("sp_era_season_diff",         "home_sp_era_season",         "away_sp_era_season")  # NEW
+    add_diff("sp_whip_last5_diff",         "home_sp_whip_last5",         "away_sp_whip_last5")  # NEW
+    add_diff("sp_k9_last5_diff",           "home_sp_k9_last5",           "away_sp_k9_last5")
+    add_diff("sp_days_rest_diff",          "home_sp_days_rest",          "away_sp_days_rest")
+    add_diff("sp_pitches_last_start_diff", "home_sp_pitches_last_start", "away_sp_pitches_last_start")  # NEW
+    add_diff("sp_innings_season_diff",     "home_sp_innings_season",     "away_sp_innings_season")      # NEW
+
+    # Statcast SP
     add_diff("sp_xwoba_against_diff",  "home_sp_xwoba_against_90",  "away_sp_xwoba_against_90")
     add_diff("sp_k_rate_diff",         "home_sp_k_rate_90",         "away_sp_k_rate_90")
     add_diff("sp_bb_rate_diff",        "home_sp_bb_rate_90",        "away_sp_bb_rate_90")
     add_diff("sp_gb_rate_diff",        "home_sp_gb_rate_90",        "away_sp_gb_rate_90")
     add_diff("sp_n_pa_diff",           "home_sp_n_pa_90",           "away_sp_n_pa_90")
-    add_diff("lineup_xwoba_diff",      "home_lineup_xwoba_90",      "away_lineup_xwoba_90")
-    add_diff("lineup_k_rate_diff",     "home_lineup_k_rate_90",     "away_lineup_k_rate_90")
-    add_diff("lineup_bb_rate_diff",    "home_lineup_bb_rate_90",    "away_lineup_bb_rate_90")
-    add_diff("lineup_n_pa_diff",       "home_lineup_n_pa_90",       "away_lineup_n_pa_90")
-    add_diff("lineup_vs_sp_score_diff","home_lineup_vs_sp_score",   "away_lineup_vs_sp_score")
 
-    # New lineup power diffs (from build_features.py)
-    add_diff("lineup_barrel_rate_diff",   "home_lineup_barrel_rate_90",   "away_lineup_barrel_rate_90")
-    add_diff("lineup_hard_hit_rate_diff", "home_lineup_hard_hit_rate_90", "away_lineup_hard_hit_rate_90")
+    # Statcast lineup
+    add_diff("lineup_xwoba_diff",          "home_lineup_xwoba_90",         "away_lineup_xwoba_90")
+    add_diff("lineup_k_rate_diff",         "home_lineup_k_rate_90",        "away_lineup_k_rate_90")
+    add_diff("lineup_bb_rate_diff",        "home_lineup_bb_rate_90",       "away_lineup_bb_rate_90")
+    add_diff("lineup_n_pa_diff",           "home_lineup_n_pa_90",          "away_lineup_n_pa_90")
+    add_diff("lineup_vs_sp_score_diff",    "home_lineup_vs_sp_score",      "away_lineup_vs_sp_score")
+    add_diff("lineup_barrel_rate_diff",    "home_lineup_barrel_rate_90",   "away_lineup_barrel_rate_90")
+    add_diff("lineup_hard_hit_rate_diff",  "home_lineup_hard_hit_rate_90", "away_lineup_hard_hit_rate_90")
 
-    # New short-window team stat diffs
-    add_diff("runs_for_7d_diff",     "home_runs_for_7d",     "away_runs_for_7d")
-    add_diff("runs_for_15d_diff",    "home_runs_for_15d",    "away_runs_for_15d")
-    add_diff("runs_against_7d_diff", "home_runs_against_7d", "away_runs_against_7d")
-    add_diff("runs_against_15d_diff","home_runs_against_15d","away_runs_against_15d")
-    add_diff("win_pct_7d_diff",      "home_win_pct_7d",      "away_win_pct_7d")
-    add_diff("win_pct_15d_diff",     "home_win_pct_15d",     "away_win_pct_15d")
-
-    # New SP recent form diffs
-    add_diff("sp_era_last3_diff",  "home_sp_era_last3",  "away_sp_era_last3")
-    add_diff("sp_k9_last5_diff",   "home_sp_k9_last5",   "away_sp_k9_last5")
-    add_diff("sp_days_rest_diff",  "home_sp_days_rest",  "away_sp_days_rest")
-
-    # Absolute scoring environment — global columns, NOT diffs, pass through as-is.
-    # total_offense_env and total_defense_env are computed in build_features.py
-    # from existing features_game 60d columns. They require no add_diff here.
-
-    # Wind cyclic encoding from raw degrees
+    # Wind cyclic encoding
     if "wind_dir_deg" in out.columns:
         wd = out["wind_dir_deg"].astype(float)
         out["wind_dir_sin"] = np.sin(np.deg2rad(wd))
@@ -303,10 +351,6 @@ def add_game_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_missingness_flags(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add binary indicator columns for features with meaningful missingness.
-    Call AFTER all diffs are finalised so source columns are present.
-    """
     out = df.copy()
     for col in ["lineup_skill_diff", "matchup_diff"]:
         flag = f"{col}_known"
@@ -318,14 +362,6 @@ def add_missingness_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_team_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Diff features derived from team_* / opp_* columns after the home/away
-    rename. Naturally team-vs-opponent for both rows.
-
-    lineup_skill_diff and matchup_diff are precomputed in features_game and
-    pass through as global columns — only recomputed here as a fallback if
-    somehow absent.
-    """
     out = df.copy()
 
     def first_existing(candidates):
@@ -336,7 +372,7 @@ def add_team_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
 
     def add_diff_if_missing(new_col, team_candidates, opp_candidates):
         if new_col in out.columns:
-            return  # already present — do not overwrite
+            return
         tc = first_existing(team_candidates)
         oc = first_existing(opp_candidates)
         if tc is not None and oc is not None:
@@ -353,7 +389,6 @@ def add_team_level_diff_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_two_row_dataset(df_game: pd.DataFrame) -> pd.DataFrame:
-    # Step 1: game-level diffs (home - away) on the raw frame.
     df_game = add_game_level_diff_features(df_game)
 
     cols      = df_game.columns.tolist()
@@ -372,9 +407,6 @@ def build_two_row_dataset(df_game: pd.DataFrame) -> pd.DataFrame:
 
     id_cols = ["game_id", "game_date", "season"]
 
-    # ------------------------------------------------------------------
-    # HOME rows — diff features are (home - away), correct as team-vs-opp
-    # ------------------------------------------------------------------
     home = df_game[
         id_cols + ["home_team_id", "away_team_id", "home_runs"]
         + global_cols + home_cols + away_cols
@@ -388,9 +420,6 @@ def build_two_row_dataset(df_game: pd.DataFrame) -> pd.DataFrame:
     home = home.rename(columns={c: "team_" + c[5:] for c in home_cols})
     home = home.rename(columns={c: "opp_"  + c[5:] for c in away_cols})
 
-    # ------------------------------------------------------------------
-    # AWAY rows — flip game-level diffs so they read (team - opponent)
-    # ------------------------------------------------------------------
     away = df_game[
         id_cols + ["home_team_id", "away_team_id", "away_runs"]
         + global_cols + home_cols + away_cols
@@ -404,14 +433,10 @@ def build_two_row_dataset(df_game: pd.DataFrame) -> pd.DataFrame:
     away = away.rename(columns={c: "team_" + c[5:] for c in away_cols})
     away = away.rename(columns={c: "opp_"  + c[5:] for c in home_cols})
 
-    # KEY FIX: negate all game-level diffs for the away row
     for col in GAME_LEVEL_DIFF_COLS:
         if col in away.columns:
             away[col] = -away[col]
 
-    # ------------------------------------------------------------------
-    # Combine
-    # ------------------------------------------------------------------
     common_cols = [c for c in home.columns if c in away.columns]
     seen, deduped = set(), []
     for c in common_cols:
@@ -421,23 +446,13 @@ def build_two_row_dataset(df_game: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.concat([home[deduped], away[deduped]], ignore_index=True)
     out = out.loc[:, ~out.columns.duplicated()].copy()
-
-    # Step 2: team-level diffs (only fills gaps, won't overwrite existing cols)
     out = add_team_level_diff_features(out)
-
-    # Step 3: missingness flags — must come AFTER all diffs are finalised
     out = add_missingness_flags(out)
-
     out = out.dropna(subset=["target_runs"]).copy()
 
-    # ── Residual target: subtract league mean so model learns deviations ──
-    # This eliminates the absolute intercept problem — the model only needs
-    # to learn how much each team deviates from the current league average.
-    # league_avg_runs_60d is the per-team (not total) league average.
-    # At inference: predicted_runs = model_output + league_avg_runs_60d
-    TRAINING_LEAGUE_MEAN = 4.50  # fallback for early-season games (< 50 prior games)
+    TRAINING_LEAGUE_MEAN = 4.50
     out["league_baseline"] = out["league_avg_runs_60d"].fillna(TRAINING_LEAGUE_MEAN)
-    out["target_runs_raw"] = out["target_runs"].copy()  # keep for diagnostics
+    out["target_runs_raw"] = out["target_runs"].copy()
     out["target_runs"]     = out["target_runs"] - out["league_baseline"]
 
     return out
@@ -447,7 +462,7 @@ def build_two_row_dataset(df_game: pd.DataFrame) -> pd.DataFrame:
 # Training
 # ---------------------------------------------------------------------------
 
-def train(df: pd.DataFrame, seed: int = 42):  # df must contain league_baseline and target_runs_raw
+def train(df: pd.DataFrame, seed: int = 42):
     y_col = df.loc[:, "target_runs"]
     if isinstance(y_col, pd.DataFrame):
         y_col = y_col.iloc[:, 0]
@@ -470,14 +485,9 @@ def train(df: pd.DataFrame, seed: int = 42):  # df must contain league_baseline 
         )
     X = X[LOCKED_FEATURES].copy()
 
-    # Impute non-passthrough features with column medians.
-    # Weather and statcast NaNs pass through to LightGBM — genuinely missing
-    # data (no lineup, no SP history) is more honestly represented as NaN
-    # than as an imputed median.
     non_passthrough = [c for c in LOCKED_FEATURES if c not in NAN_PASSTHROUGH_FEATURES]
     X[non_passthrough] = X[non_passthrough].fillna(X[non_passthrough].median())
 
-    # Validate
     all_null = [c for c in X.columns if X[c].isna().all()]
     if all_null:
         raise RuntimeError(
@@ -496,8 +506,9 @@ def train(df: pd.DataFrame, seed: int = 42):  # df must contain league_baseline 
         if c in X.columns:
             X[c] = X[c].astype("category")
 
-    train_mask = season_int <= 2022
-    val_mask   = season_int == 2023
+    # v9: train on 2015-2024, validate on 2025
+    train_mask = season_int <= 2023
+    val_mask   = season_int == 2024
 
     X_train, X_val = X.loc[train_mask], X.loc[val_mask]
     y_train, y_val = y[train_mask.to_numpy()], y[val_mask.to_numpy()]
@@ -505,7 +516,7 @@ def train(df: pd.DataFrame, seed: int = 42):  # df must contain league_baseline 
     print(f"\nTrain rows: {len(X_train)}  Val rows: {len(X_val)}")
 
     model = LGBMRegressor(
-        objective="regression_l2",  # MSE — correct for residual prediction
+        objective="regression_l2",
         n_estimators=5000,
         learning_rate=0.03,
         num_leaves=128,
@@ -525,15 +536,11 @@ def train(df: pd.DataFrame, seed: int = 42):  # df must contain league_baseline 
         eval_metric="rmse",
     )
 
-    # ------------------------------------------------------------------
-    # Diagnostics — convert residuals back to raw runs for interpretability
-    # ------------------------------------------------------------------
+    # Diagnostics
     pred_residuals = model.predict(X).astype(float)
-
-    # Get league baseline for all rows (stored in df before target was residualized)
     league_baseline = df["league_baseline"].values
     target_raw      = df["target_runs_raw"].values
-    pred_raw        = pred_residuals + league_baseline  # convert back to raw runs
+    pred_raw        = pred_residuals + league_baseline
 
     tmp = pd.DataFrame({
         "is_home":        X["is_home"].astype(float).values,
@@ -548,8 +555,6 @@ def train(df: pd.DataFrame, seed: int = 42):  # df must contain league_baseline 
     print("\nBy is_home — mean bias (pred - actual, raw runs):")
     tmp["bias"] = tmp["prediction_raw"] - tmp["target_runs"]
     print(tmp.groupby("is_home")["bias"].mean().to_string())
-    print("\nBy is_home — mean residual predicted:")
-    print(tmp.groupby("is_home")["residual"].mean().to_string())
 
     home_pred = pred_raw[X["is_home"].astype(float).values == 1.0]
     away_pred = pred_raw[X["is_home"].astype(float).values == 0.0]
@@ -569,8 +574,8 @@ def train(df: pd.DataFrame, seed: int = 42):  # df must contain league_baseline 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--schema",       default="public")
-    ap.add_argument("--out",          default="artifacts/runs_model_team_lgbm.joblib")
-    ap.add_argument("--features_out", default="artifacts/runs_model_team_features.txt")
+    ap.add_argument("--out",          default="artifacts/runs_model_v9.joblib")
+    ap.add_argument("--features_out", default="artifacts/runs_model_v9_features.txt")
     ap.add_argument("--seed",         type=int, default=42)
     args = ap.parse_args()
 

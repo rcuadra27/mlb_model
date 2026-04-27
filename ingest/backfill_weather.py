@@ -415,7 +415,12 @@ def main():
     if not args.pg_dsn:
         raise ValueError("PG_DSN not set")
 
-    conn = psycopg2.connect(args.pg_dsn)
+    dsn = args.pg_dsn
+    if dsn.startswith("postgresql+psycopg2://"):
+        dsn = "postgresql://" + dsn[len("postgresql+psycopg2://"):]
+    elif dsn.startswith("postgres+psycopg2://"):
+        dsn = "postgres://" + dsn[len("postgres+psycopg2://"):]
+    conn = psycopg2.connect(dsn)
 
     backfill_weather_open_meteo(
         conn,

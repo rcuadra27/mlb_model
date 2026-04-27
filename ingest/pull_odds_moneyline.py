@@ -213,7 +213,12 @@ def main():
     print(f"Processing {len(dates)} date(s) from {dates[0]} to {dates[-1]}")
 
     client = TheOddsAPI()
-    conn = psycopg2.connect(args.pg_dsn)
+    dsn = args.pg_dsn
+    if dsn and dsn.startswith("postgresql+psycopg2://"):
+        dsn = "postgresql://" + dsn[len("postgresql+psycopg2://"):]
+    elif dsn and dsn.startswith("postgres+psycopg2://"):
+        dsn = "postgres://" + dsn[len("postgres+psycopg2://"):]
+    conn = psycopg2.connect(dsn)
 
     total_rows = 0
     processed_dates = 0

@@ -1,0 +1,5 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'gcr.io/mlb-model-491223/mlb-model', '-f', 'Dockerfile.pipeline', '.']
+images:
+- 'gcr.io/mlb-model-491223/mlb-model'

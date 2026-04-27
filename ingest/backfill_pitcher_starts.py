@@ -31,7 +31,7 @@ def ip_str_to_outs(ip: Optional[str]) -> Optional[int]:
     try:
         w = int(whole)
         f = int(frac)
-        if f not in (0, 1, 2):  # sometimes weird, but usually 0/1/2
+        if f not in (0, 1, 2):
             return w * 3
         return w * 3 + f
     except:
@@ -64,7 +64,7 @@ def fetch_feed(game_id: int, session: requests.Session, max_retries: int = 6) ->
 def extract_starter_stats(feed: Dict[str, Any], pitcher_id: int, side: str) -> Dict[str, Any]:
     """
     side: 'home' or 'away' (the team the pitcher belongs to in this game)
-    Returns outs_pitched, innings_pitched, runs_allowed
+    Returns outs_pitched, innings_pitched, runs_allowed, hits_allowed, walks_allowed
     """
     box = feed.get("liveData", {}).get("boxscore", {})
     team = (box.get("teams", {}) or {}).get(side, {}) or {}
@@ -74,23 +74,30 @@ def extract_starter_stats(feed: Dict[str, Any], pitcher_id: int, side: str) -> D
 
     ip = stats.get("inningsPitched")  # typically string like "5.2"
     outs = ip_str_to_outs(ip)
-    runs = stats.get("runs")  # int
+    runs   = stats.get("runs")
+    hits   = stats.get("hits")
+    walks  = stats.get("baseOnBalls")
+    pitches = stats.get("pitchesThrown")
 
     return {
-        "outs_pitched": outs,
+        "outs_pitched":    outs,
         "innings_pitched": outs_to_ip(outs),
-        "runs_allowed": int(runs) if runs is not None else None,
+        "runs_allowed":    int(runs)    if runs    is not None else None,
+        "hits_allowed":    int(hits)    if hits    is not None else None,
+        "walks_allowed":   int(walks)   if walks   is not None else None,
+        "pitches_thrown":  int(pitches) if pitches is not None else None,
     }
 
 
 def process_game_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     row contains: game_id, game_date, home_team_id, away_team_id, home_sp_id, away_sp_id
-    Return 2 pitcher_start rows (home starter + away starter), if possible.
+    Returns 2 pitcher_start rows (home starter + away starter).
+    Only called for completed games (home_runs IS NOT NULL) so no 0 IP placeholders.
     """
     if not hasattr(process_game_row, "_session"):
-        process_game_row._session = requests.Session()  # type: ignore[attr-defined]
-    session = process_game_row._session  # type: ignore[attr-defined]
+        process_game_row._session = requests.Session()
+    session = process_game_row._session
 
     gid = int(row["game_id"])
     feed = fetch_feed(gid, session=session)
@@ -102,12 +109,12 @@ def process_game_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         pid = int(row["home_sp_id"])
         st = extract_starter_stats(feed, pid, "home")
         out.append({
-            "game_id": gid,
-            "game_date": row["game_date"],
-            "pitcher_id": pid,
-            "team_id": int(row["home_team_id"]),
+            "game_id":          gid,
+            "game_date":        row["game_date"],
+            "pitcher_id":       pid,
+            "team_id":          int(row["home_team_id"]),
             "opponent_team_id": int(row["away_team_id"]),
-            "is_home": True,
+            "is_home":          True,
             **st,
             "source": "mlb_feed_boxscore",
         })
@@ -117,17 +124,38 @@ def process_game_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         pid = int(row["away_sp_id"])
         st = extract_starter_stats(feed, pid, "away")
         out.append({
-            "game_id": gid,
-            "game_date": row["game_date"],
-            "pitcher_id": pid,
-            "team_id": int(row["away_team_id"]),
+            "game_id":          gid,
+            "game_date":        row["game_date"],
+            "pitcher_id":       pid,
+            "team_id":          int(row["away_team_id"]),
             "opponent_team_id": int(row["home_team_id"]),
-            "is_home": False,
+            "is_home":          False,
             **st,
             "source": "mlb_feed_boxscore",
         })
 
     return out
+
+
+def ensure_columns(conn) -> None:
+    """Add hits_allowed and walks_allowed columns if they don't exist yet."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'pitcher_starts'
+        """)
+        existing = {r[0] for r in cur.fetchall()}
+
+        for col, dtype in [
+            ("hits_allowed",   "INTEGER"),
+            ("walks_allowed",  "INTEGER"),
+            ("pitches_thrown", "INTEGER"),
+        ]:
+            if col not in existing:
+                cur.execute(f"ALTER TABLE pitcher_starts ADD COLUMN {col} {dtype}")
+                print(f"  Added column: {col}")
+
+    conn.commit()
 
 
 def upsert_pitcher_starts(conn, rows: List[Dict[str, Any]]) -> None:
@@ -137,24 +165,29 @@ def upsert_pitcher_starts(conn, rows: List[Dict[str, Any]]) -> None:
     sql = """
     INSERT INTO pitcher_starts (
       game_id, game_date, pitcher_id, team_id, opponent_team_id, is_home,
-      outs_pitched, innings_pitched, runs_allowed, source
+      outs_pitched, innings_pitched, runs_allowed, hits_allowed, walks_allowed,
+      pitches_thrown, source
     )
     VALUES %s
     ON CONFLICT (game_id, pitcher_id) DO UPDATE SET
-      game_date = EXCLUDED.game_date,
-      team_id = EXCLUDED.team_id,
-      opponent_team_id = EXCLUDED.opponent_team_id,
-      is_home = EXCLUDED.is_home,
-      outs_pitched = EXCLUDED.outs_pitched,
-      innings_pitched = EXCLUDED.innings_pitched,
-      runs_allowed = EXCLUDED.runs_allowed,
-      source = EXCLUDED.source,
-      updated_at = now();
+      game_date         = EXCLUDED.game_date,
+      team_id           = EXCLUDED.team_id,
+      opponent_team_id  = EXCLUDED.opponent_team_id,
+      is_home           = EXCLUDED.is_home,
+      outs_pitched      = EXCLUDED.outs_pitched,
+      innings_pitched   = EXCLUDED.innings_pitched,
+      runs_allowed      = EXCLUDED.runs_allowed,
+      hits_allowed      = EXCLUDED.hits_allowed,
+      walks_allowed     = EXCLUDED.walks_allowed,
+      pitches_thrown    = EXCLUDED.pitches_thrown,
+      source            = EXCLUDED.source,
+      updated_at        = now();
     """
 
     values = [[
         r["game_id"], r["game_date"], r["pitcher_id"], r["team_id"], r["opponent_team_id"], r["is_home"],
-        r["outs_pitched"], r["innings_pitched"], r["runs_allowed"], r["source"]
+        r["outs_pitched"], r["innings_pitched"], r["runs_allowed"],
+        r["hits_allowed"], r["walks_allowed"], r["pitches_thrown"], r["source"]
     ] for r in rows]
 
     with conn.cursor() as cur:
@@ -164,19 +197,38 @@ def upsert_pitcher_starts(conn, rows: List[Dict[str, Any]]) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pg_dsn", default=os.environ.get("PG_DSN"))
-    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--pg_dsn",     default=os.environ.get("PG_DSN"))
+    ap.add_argument("--workers",    type=int, default=12)
     ap.add_argument("--batch_size", type=int, default=1000)
-    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--limit",      type=int, default=None)
+    ap.add_argument("--start",      default=None, help="Reprocess from this date (YYYY-MM-DD)")
     args = ap.parse_args()
 
     if not args.pg_dsn:
         raise SystemExit("Missing --pg_dsn and $PG_DSN is not set")
 
-    conn = psycopg2.connect(args.pg_dsn)
+    # psycopg2 can't parse SQLAlchemy-style "+psycopg2" URL prefixes; strip them.
+    dsn = args.pg_dsn
+    if dsn.startswith("postgresql+psycopg2://"):
+        dsn = "postgresql://" + dsn[len("postgresql+psycopg2://"):]
+    elif dsn.startswith("postgres+psycopg2://"):
+        dsn = "postgres://" + dsn[len("postgres+psycopg2://"):]
+    conn = psycopg2.connect(dsn)
 
-    # Select games where starters exist, and we haven't ingested pitcher_starts for them yet
-    q = """
+    # Ensure schema is up to date
+    print("Ensuring columns exist...")
+    ensure_columns(conn)
+
+    # KEY FIX: only process completed games (home_runs IS NOT NULL)
+    # This prevents today's pre-game placeholder rows (0 IP, 0 runs) from being inserted.
+    # Also pick up games missing hits_allowed/walks_allowed even if already ingested.
+    date_filter = ""
+    params = {}
+    if args.start:
+        date_filter = "AND g.game_date >= %(start)s"
+        params["start"] = args.start
+
+    q = f"""
     SELECT
       g.game_id,
       g.game_date,
@@ -186,32 +238,47 @@ def main():
       sp.away_sp_id
     FROM games g
     JOIN game_starting_pitchers sp ON sp.game_id = g.game_id
-    LEFT JOIN pitcher_starts ps_home ON ps_home.game_id = g.game_id AND ps_home.pitcher_id = sp.home_sp_id
-    LEFT JOIN pitcher_starts ps_away ON ps_away.game_id = g.game_id AND ps_away.pitcher_id = sp.away_sp_id
+    LEFT JOIN pitcher_starts ps_home
+        ON ps_home.game_id = g.game_id
+        AND ps_home.pitcher_id = sp.home_sp_id
+        AND ps_home.hits_allowed IS NOT NULL
+        AND ps_home.pitches_thrown IS NOT NULL
+    LEFT JOIN pitcher_starts ps_away
+        ON ps_away.game_id = g.game_id
+        AND ps_away.pitcher_id = sp.away_sp_id
+        AND ps_away.hits_allowed IS NOT NULL
+        AND ps_away.pitches_thrown IS NOT NULL
     WHERE
-      g.home_runs IS NOT NULL AND g.away_runs IS NOT NULL
-      AND g.game_date >= CURRENT_DATE - INTERVAL '7 days'
+      g.home_runs IS NOT NULL
+      AND g.away_runs IS NOT NULL
+      AND (ps_home.game_id IS NULL OR ps_away.game_id IS NULL)
+      {date_filter}
     ORDER BY g.game_date, g.game_id;
     """
 
     with conn.cursor() as cur:
-        cur.execute(q)
+        cur.execute(q, params)
         raw = cur.fetchall()
 
     rows = [{
-        "game_id": r[0],
-        "game_date": r[1],
+        "game_id":      r[0],
+        "game_date":    r[1],
         "home_team_id": r[2],
         "away_team_id": r[3],
-        "home_sp_id": r[4],
-        "away_sp_id": r[5],
+        "home_sp_id":   r[4],
+        "away_sp_id":   r[5],
     } for r in raw]
 
     if args.limit:
-        rows = rows[: args.limit]
+        rows = rows[:args.limit]
 
     total = len(rows)
     print(f"Need starter boxscore stats for {total} games")
+
+    if total == 0:
+        print("Nothing to do.")
+        conn.close()
+        return
 
     buffer: List[Dict[str, Any]] = []
     failures = 0

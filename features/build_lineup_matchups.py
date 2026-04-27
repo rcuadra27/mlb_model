@@ -34,9 +34,18 @@ PITCH_COLS_SKILL = ["skill_ff","skill_si","skill_fc","skill_sl","skill_cu","skil
 def dot_matchup(pmix: np.ndarray, bskill: np.ndarray) -> float:
     if pmix.shape != bskill.shape:
         return float("nan")
-    if np.any(np.isnan(pmix)) or np.any(np.isnan(bskill)):
+    active = pmix > 0.05
+    if active.sum() == 0:
         return float("nan")
-    return float(np.dot(pmix, bskill))
+    pmix_active   = pmix[active]
+    bskill_active = bskill[active]
+    valid = np.isfinite(bskill_active)
+    if valid.sum() == 0:
+        return float("nan")
+    pmix_valid   = pmix_active[valid]
+    bskill_valid = bskill_active[valid]
+    pmix_valid   = pmix_valid / pmix_valid.sum()
+    return float(np.dot(pmix_valid, bskill_valid))
 
 
 def ensure_columns(engine, schema: str = "public"):
@@ -222,8 +231,6 @@ def main():
                     if row is None:
                         continue
                     v = row[PITCH_COLS_SKILL].to_numpy(dtype=float)
-                    if np.any(np.isnan(v)):
-                        continue
                     vecs.append(v)
                 if not vecs:
                     return np.full(len(PITCH_COLS_SKILL), np.nan, dtype=float)
@@ -239,8 +246,6 @@ def main():
                 if row is None:
                     return np.full(len(PITCH_COLS_MIX), np.nan, dtype=float)
                 v = row[PITCH_COLS_MIX].to_numpy(dtype=float)
-                if np.any(np.isnan(v)):
-                    return np.full(len(PITCH_COLS_MIX), np.nan, dtype=float)
                 return v
 
             home_sp_mix = mix_vec(r.home_sp_id)

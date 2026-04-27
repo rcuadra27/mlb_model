@@ -1,0 +1,7 @@
+# Exclude everything...
+*
+
+# ...except the build output and the Dockerfile
+!Dockerfile
+!dist/
+!dist/**

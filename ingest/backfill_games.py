@@ -148,6 +148,13 @@ def main():
     if not pg_dsn:
         raise RuntimeError("Provide --pg_dsn or set PG_DSN env var.")
 
+    # psycopg2 doesn't understand SQLAlchemy-style "+driver" URL prefixes,
+    # so strip e.g. "postgresql+psycopg2://..." back to "postgresql://..."
+    if pg_dsn.startswith("postgresql+psycopg2://"):
+        pg_dsn = "postgresql://" + pg_dsn[len("postgresql+psycopg2://"):]
+    elif pg_dsn.startswith("postgres+psycopg2://"):
+        pg_dsn = "postgres://" + pg_dsn[len("postgres+psycopg2://"):]
+
     start = dt.date.fromisoformat(args.start)
     end   = dt.date.fromisoformat(args.end)
     conn  = psycopg2.connect(pg_dsn)
