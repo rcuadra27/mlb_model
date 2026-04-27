@@ -1,154 +1,185 @@
 # MLB Game Prediction System
 
-A production ML system that predicts MLB game outcomes using LightGBM, deployed on Google Cloud Platform with a React dashboard at [mlbpredictor.com](https://mlbpredictor.com).
+A production ML system that predicts MLB game outcomes using gradient-boosted run models and market calibration, deployed on Google Cloud Platform. The public site is **[mlbpredictor.com](https://mlbpredictor.com)** — a React dashboard with live scores, model vs market edges, model accuracy tracking, and an optional **AI assistant** that answers questions using the same data the model uses.
 
 ## Architecture
+
 ```
-MLB Stats API / Statcast / Odds API
+MLB Stats API / Statcast / Odds API / Open-Meteo (weather)
         ↓
    Cloud SQL (PostgreSQL) ← source of truth
         ↓
-   Cloud Run Jobs (daily pipeline)
+   Cloud Run jobs (daily pipeline, PT schedule)
         ↓
-   BigQuery (serving layer)
+   BigQuery (mlb_model_logs.daily_games) — serving mirror
         ↓
-   Cloud Function → React Dashboard (mlbpredictor.com)
+   Cloud Functions (HTTP) ──→ React dashboard (Cloud Run / static)
+        • get-daily-predictions — games JSON, model accuracy, odds board
+        • mlb-agent-chat — Claude-powered Q&A over predictions + features
 ```
 
-## Model
+## Web dashboard
 
-- **Algorithm**: LightGBM (`runs_model_v8`)
-- **Approach**: Residual regression — predicts deviation from league average runs (4.50)
-- **Target**: `actual_runs - league_avg_runs_60d` per team per game
-- **49 features**: SP ERA/xwoba/K-rate, lineup xwoba/barrel rate, team rolling stats (7d/15d/30d/60d), park factors, umpire tendencies, weather
-- **Win probability**: Skellam distribution from predicted run totals (0.30–0.70 cap)
-- **No calibration**: Raw Skellam probabilities (`--no_calibrate`)
+Built with **Vite + React** (`dashboard/`). Served as a static build (nginx in `dashboard/Dockerfile`).
 
-## Project Structure
+| Area | What it does |
+|------|----------------|
+| **Games** | Pacific **date strip**; schedule of games with model win %, market %, edges, run predictions, O/U line and recommendation. Games are shown **only after starting lineups are confirmed** (when the pipeline has a full snapshot). |
+| **Model accuracy** | Rolling **moneyline** and **over/under** stats (flat $10 stake), confidence buckets, and daily P&amp;L charts. Backed by `get-daily-predictions?view=accuracy` (grades finished games from Postgres or BigQuery). |
+| **About us** | Long-form explanation of the model, features, training, deployment, and limitations (static copy + architecture diagrams). |
+| **Assistant** | Floating chat widget calling **`mlb-agent-chat`**. Context includes the selected slate date and (on a game page) the matchup. |
+
+Branding uses the project logos in `dashboard/public/`. All **calendar days** in the UI are **US Pacific** (`America/Los_Angeles`), aligned with MLB slate dates.
+
+## MLB Agent Chat
+
+`agent_chat/` is a **2nd gen Cloud Function** that runs a small **Claude** (Haiku) agent with **tools**:
+
+- Pull game predictions and market lines from BigQuery  
+- Load per-game **feature rows** from Cloud SQL (why the model leans a certain way)  
+- Team lookup, recent accuracy summaries, feature-importance CSVs  
+
+**Time zone:** tools and the system prompt use **`America/Los_Angeles`** for “today” and default dates, matching the dashboard (not UTC).
+
+**Config:** `ANTHROPIC_API_KEY`, `PG_DSN`, and the same BigQuery table as the rest of the stack. See `agent_chat/requirements.txt` and `agent_chat/main.py`.
+
+## Cloud Function: `get-daily-predictions`
+
+`cloud_function/main.py` — single HTTP entrypoint with **views**:
+
+| Query | Purpose |
+|-------|--------|
+| `?date=YYYY-MM-DD` | Daily game list for the dashboard (from BigQuery). |
+| `?view=accuracy` | Aggregated ML and O/U grading, buckets, daily P&amp;L (Postgres preferred via `PG_DSN`, else BigQuery). |
+| `?view=odds_board` | Odds board payload (when enabled). |
+
+Accuracy logic applies the same grading rules in one place so the **Model accuracy** tab matches how picks are evaluated.
+
+## Model (summary)
+
+- **Core:** LightGBM **team run** models (home/away expected runs), plus derived **win probability** and **totals** vs the market.  
+- **Features:** Pitching (season + rolling windows), bullpen workload, lineup/matchup signals, **weather** (Open-Meteo), **umpire** tendencies, **market** lines and movement.  
+- **Calibration:** Inference can apply a stored **calibrator** (e.g. isotonic) to raw win probabilities so tail behavior lines up with historical closing odds.  
+- **Production** metadata in exports refer to the current pipeline generation (e.g. **v9** in app copy); artifact filenames in-repo may still say `optionA` / older tags — treat the **inference + export** path as source of truth for what’s live.
+
+For a full narrative, see the **About us** page on the site.
+
+## Project structure (selected)
+
 ```
 mlb_model/
-├── artifacts/
-│   ├── runs_model_v8.joblib          # Production model (local)
-│   ├── runs_model_v8.txt             # Production model (container)
-│   └── runs_model_v8_features.txt    # 49 feature names
-│
-├── ingest/                           # Data ingestion
-│   ├── backfill_games.py             # Game schedule + results
-│   ├── backfill_startingpitchers.py  # Starting pitcher assignments
-│   ├── backfill_pitcher_starts.py    # Pitcher start stats (ERA, IP)
-│   ├── backfill_pitcher_appearances.py # Bullpen appearance data
-│   ├── backfill_games_stadiums.py    # Stadium/venue data
-│   ├── backfill_reliever_entry_context.py # Reliever context
-│   ├── backfill_weather.py           # Historical weather
-│   ├── ingest_lineups.py             # Confirmed batting orders + triggers inference
-│   ├── ingest_statcast.py            # Baseball Savant pitch data
-│   ├── ingest_teams.py               # Team metadata
-│   └── pull_odds_moneyline.py        # Odds ingestion
-│
-├── features/                         # Feature engineering
-│   ├── build_features1.py            # Main feature pipeline (all 49 features)
-│   ├── closing_odds_scheduler.py     # Pre-game odds collection + inference trigger
-│   ├── umpire_features.py            # Umpire run tendency features
-│   ├── weather_forecast.py           # Open-Meteo weather forecasts
-│   ├── market_movement.py            # Morning vs closing line movement
-│   ├── build_lineup_matchups.py      # Lineup vs SP matchup scores
-│   ├── add_market_median_ml.py       # Market median ML odds
-│   ├── add_poisson_winprob.py        # Poisson win probability
-│   ├── add_run_preds_to_features.py  # Run predictions to features
-│   └── build_blended_prob.py         # Blended probability model
-│
-├── inference/
-│   └── inference.py                  # Main inference engine
-│
-├── models/
-│   ├── train_runs_team_lgbm.py       # Model training script
-│   └── train_expected_runs.py        # Expected runs model
-│
-├── calibration/
-│   └── calibration.py                # Probability calibration
-│
-├── cloud_function/
-│   ├── main.py                       # BigQuery serving endpoint
-│   └── requirements.txt
-│
-├── dashboard/
-│   └── src/
-│       └── App.jsx                   # React dashboard
-│
-├── backtest/
-│   └── backtest_moneyline.py         # Historical backtesting
-│
-├── evaluation/
-│   └── evaluate_model_quality.py     # Model evaluation metrics
-│
-├── odds/
-│   └── the_odds_api.py               # The Odds API wrapper
-│
-├── pricing/
-│   └── build_ev_board.py             # Expected value calculations
-│
-├── export_to_bigquery.py             # PostgreSQL → BigQuery export
-├── run_daily.sh                      # Daily pipeline entrypoint (Cloud Run)
-├── Dockerfile.pipeline               # Pipeline container
-├── Dockerfile.dashboard              # Dashboard container
-└── requirements.txt                  # Python dependencies
+├── agent_chat/                 # mlb-agent-chat Cloud Function (Claude + tools)
+├── cloud_function/             # get-daily-predictions (games, accuracy, odds)
+├── dashboard/                  # React app + public assets + Dockerfile
+├── features/                   # Feature pipelines (build_features1, lineups, odds scheduler, …)
+├── ingest/                     # Schedule, pitchers, lineups, weather, odds pulls
+├── inference/                  # Daily inference + calibration hooks
+├── models/                     # Training scripts
+├── calibration/                # Calibrators used at inference
+├── artifacts/                  # Trained models & calibrators (large; see .gitignore)
+├── export_to_bigquery.py
+├── run_daily.sh                # Pipeline steps (PT) for Cloud Run
+├── Dockerfile.pipeline
+├── cloudbuild.yaml             # Example build for pipeline image
+└── README.md
 ```
 
-## Daily Pipeline (Cloud Run Jobs, PT timezone)
+## Daily pipeline (PT)
 
-| Time PT | Job | Script |
-|---------|-----|--------|
-| 6:00am | Backfill yesterday results + today schedule | `backfill_games.py --start YESTERDAY --end TODAY` |
-| 6:05am | Starting pitcher assignments | `backfill_startingpitchers.py` |
-| 6:15am | Pitcher start stats | `backfill_pitcher_starts.py` |
-| 6:25am | Bullpen appearances | `backfill_pitcher_appearances.py` |
-| 6:35am | Build features (no statcast) | `build_features1.py --date TODAY` |
-| 6:50am | Morning odds + closing odds scheduler | `closing_odds_scheduler.py --date TODAY` |
-| 7:45am | Umpire features | `umpire_features.py --date TODAY` |
-| 8:00am | Weather forecasts | `weather_forecast.py --date TODAY` |
-| 8:15am | Rebuild features with weather | `build_features1.py --date TODAY` |
-| 8:30am | Lineup confirmation + inference trigger | `ingest_lineups.py --date TODAY` |
+Jobs are orchestrated from **`run_daily.sh`** and Cloud Run; exact clock times live with your GCP scheduler. Typical flow:
 
-## Inference Chain (triggered by lineups or closing odds)
+1. Backfill schedule and results  
+2. Pitchers and appearances  
+3. Features (optional statcast pass after lineups / closing window)  
+4. Odds and market movement  
+5. **Lineups** → full feature build + **inference** → **export to BigQuery** → games appear on the site  
+
+## Inference chain (lineups or closing odds)
+
 ```
-lineup confirmed OR closing odds stored 75min before first pitch
-    → build_features1.py --date TODAY  (full statcast)
-    → inference.py --date TODAY --no_calibrate --fill_missing
+lineup confirmed OR closing odds stored (per your scheduler rules)
+    → build_features1.py --date TODAY
+    → inference.py (with calibrator when configured)
     → export_to_bigquery.py --date TODAY
-    → game appears on dashboard
+    → rows available to get-daily-predictions + agent tools
 ```
 
-## Key Design Decisions
+## Key design decisions
 
-- **Closing odds frozen pre-game**: `store_closing_odds` uses `AND closing_p_home IS NULL` — never overwrites
-- **Live odds never enter system**: `fetch_all_odds` skips `commence_time <= now_utc`
-- **Morning odds stored once**: `store_morning_odds` uses `AND morning_p_home IS NULL`
-- **BigQuery explicit schema**: No `autodetect=True` — prevents type conflicts
-- **PT timezone throughout**: All date logic uses `America/Los_Angeles`
+- **Closing odds frozen pre-game** where the schema enforces a single write  
+- **Live odds** do not overwrite stored morning/closing snapshots inappropriately  
+- **BigQuery** mirror uses an explicit schema for `daily_games`  
+- **Pacific time** for schedule dates and dashboard behavior; **agent** aligned to the same calendar  
+- **Model accuracy** O/U stats can exclude specific slate dates when configured in `cloud_function/main.py` (e.g. bad data window) — moneyline unchanged  
 
-## GCP Resources
+## GCP resources
 
-- **Project**: `mlb-model-491223`
-- **Region**: `us-central1`
-- **Cloud SQL**: `mlb-postgres` (PostgreSQL 15)
-- **Pipeline image**: `gcr.io/mlb-model-491223/mlb-pipeline:v1`
-- **Dashboard image**: `gcr.io/mlb-model-491223/mlb-dashboard:v1`
-- **Cloud Function**: `get-daily-predictions`
-- **BigQuery**: `mlb_model_logs.daily_games`
+| Resource | Notes |
+|----------|--------|
+| **Project** | `mlb-model-491223` |
+| **Region** | `us-central1` (typical for functions + run) |
+| **Cloud SQL** | `mlb-postgres` (PostgreSQL) |
+| **BigQuery** | `mlb_model_logs.daily_games` |
+| **Images** | e.g. `gcr.io/mlb-model-491223/mlb-pipeline:v1`, `mlb-dashboard:v1` |
+| **Cloud Functions** | `get-daily-predictions`, `mlb-agent-chat` |
 
-## Environment Variables
+## Environment variables
+
 ```bash
+# Database (pipeline, inference, export, cloud function accuracy, agent tools)
 PG_DSN=postgresql+psycopg2://user:password@host/dbname
+
+# Odds
 ODDS_API_KEY=your_odds_api_key
+
+# Agent chat only
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-## Local Development
+## Deploying (quick reference)
+
+**Dashboard** (static + nginx):
+
 ```bash
-# Start Cloud SQL proxy
+cd dashboard && npm run build
+gcloud builds submit --tag gcr.io/mlb-model-491223/mlb-dashboard:v1 .
+gcloud run deploy mlb-dashboard --image gcr.io/mlb-model-491223/mlb-dashboard:v1 --region us-central1
+```
+
+**`get-daily-predictions`** (from repo root):
+
+```bash
+gcloud functions deploy get-daily-predictions \
+  --gen2 --runtime=python311 --region=us-central1 \
+  --source=cloud_function --entry-point=get_daily_predictions \
+  --trigger-http --allow-unauthenticated --project=mlb-model-491223
+```
+
+(Preserve existing `--set-env-vars` / secrets for `PG_DSN`, etc.)
+
+**`mlb-agent-chat`** (from repo root):
+
+```bash
+gcloud functions deploy mlb-agent-chat \
+  --gen2 --runtime=python311 --region=us-central1 \
+  --source=agent_chat --entry-point=agent_chat \
+  --trigger-http --allow-unauthenticated --project=mlb-model-491223
+```
+
+Set `ANTHROPIC_API_KEY` (and `PG_DSN` if tools need SQL) via `--set-env-vars` or Secret Manager.
+
+## Local development
+
+```bash
+# Cloud SQL Proxy
 ./cloud-sql-proxy mlb-model-491223:us-central1:mlb-postgres --port=5434
 
-# Run pipeline manually
+# Manual feature + inference + export
 PG_DSN="..." python features/build_features1.py --date 2026-03-31
-PG_DSN="..." ODDS_API_KEY="..." python inference/inference.py --date 2026-03-31 --no_calibrate --fill_missing
+PG_DSN="..." ODDS_API_KEY="..." python inference/inference.py --date 2026-03-31
 PG_DSN="..." python export_to_bigquery.py --date 2026-03-31
 ```
+
+## Contact
+
+See the **About us** page on [mlbpredictor.com](https://mlbpredictor.com) for project context and contact email.
