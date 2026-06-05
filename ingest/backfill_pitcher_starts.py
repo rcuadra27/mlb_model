@@ -64,7 +64,7 @@ def fetch_feed(game_id: int, session: requests.Session, max_retries: int = 6) ->
 def extract_starter_stats(feed: Dict[str, Any], pitcher_id: int, side: str) -> Dict[str, Any]:
     """
     side: 'home' or 'away' (the team the pitcher belongs to in this game)
-    Returns outs_pitched, innings_pitched, runs_allowed, hits_allowed, walks_allowed
+    Returns outs_pitched, innings_pitched, runs_allowed, earned_runs, hits_allowed, walks_allowed
     """
     box = feed.get("liveData", {}).get("boxscore", {})
     team = (box.get("teams", {}) or {}).get(side, {}) or {}
@@ -74,15 +74,17 @@ def extract_starter_stats(feed: Dict[str, Any], pitcher_id: int, side: str) -> D
 
     ip = stats.get("inningsPitched")  # typically string like "5.2"
     outs = ip_str_to_outs(ip)
-    runs   = stats.get("runs")
-    hits   = stats.get("hits")
-    walks  = stats.get("baseOnBalls")
+    runs = stats.get("runs")
+    earned_runs = stats.get("earnedRuns")
+    hits = stats.get("hits")
+    walks = stats.get("baseOnBalls")
     pitches = stats.get("pitchesThrown")
 
     return {
         "outs_pitched":    outs,
         "innings_pitched": outs_to_ip(outs),
         "runs_allowed":    int(runs)    if runs    is not None else None,
+        "earned_runs":     int(earned_runs) if earned_runs is not None else None,
         "hits_allowed":    int(hits)    if hits    is not None else None,
         "walks_allowed":   int(walks)   if walks   is not None else None,
         "pitches_thrown":  int(pitches) if pitches is not None else None,
@@ -147,6 +149,7 @@ def ensure_columns(conn) -> None:
         existing = {r[0] for r in cur.fetchall()}
 
         for col, dtype in [
+            ("earned_runs",    "INTEGER"),
             ("hits_allowed",   "INTEGER"),
             ("walks_allowed",  "INTEGER"),
             ("pitches_thrown", "INTEGER"),
@@ -165,7 +168,7 @@ def upsert_pitcher_starts(conn, rows: List[Dict[str, Any]]) -> None:
     sql = """
     INSERT INTO pitcher_starts (
       game_id, game_date, pitcher_id, team_id, opponent_team_id, is_home,
-      outs_pitched, innings_pitched, runs_allowed, hits_allowed, walks_allowed,
+      outs_pitched, innings_pitched, runs_allowed, earned_runs, hits_allowed, walks_allowed,
       pitches_thrown, source
     )
     VALUES %s
@@ -177,6 +180,7 @@ def upsert_pitcher_starts(conn, rows: List[Dict[str, Any]]) -> None:
       outs_pitched      = EXCLUDED.outs_pitched,
       innings_pitched   = EXCLUDED.innings_pitched,
       runs_allowed      = EXCLUDED.runs_allowed,
+      earned_runs       = EXCLUDED.earned_runs,
       hits_allowed      = EXCLUDED.hits_allowed,
       walks_allowed     = EXCLUDED.walks_allowed,
       pitches_thrown    = EXCLUDED.pitches_thrown,
@@ -186,7 +190,7 @@ def upsert_pitcher_starts(conn, rows: List[Dict[str, Any]]) -> None:
 
     values = [[
         r["game_id"], r["game_date"], r["pitcher_id"], r["team_id"], r["opponent_team_id"], r["is_home"],
-        r["outs_pitched"], r["innings_pitched"], r["runs_allowed"],
+        r["outs_pitched"], r["innings_pitched"], r["runs_allowed"], r["earned_runs"],
         r["hits_allowed"], r["walks_allowed"], r["pitches_thrown"], r["source"]
     ] for r in rows]
 
@@ -242,11 +246,13 @@ def main():
         ON ps_home.game_id = g.game_id
         AND ps_home.pitcher_id = sp.home_sp_id
         AND ps_home.hits_allowed IS NOT NULL
+        AND ps_home.earned_runs IS NOT NULL
         AND ps_home.pitches_thrown IS NOT NULL
     LEFT JOIN pitcher_starts ps_away
         ON ps_away.game_id = g.game_id
         AND ps_away.pitcher_id = sp.away_sp_id
         AND ps_away.hits_allowed IS NOT NULL
+        AND ps_away.earned_runs IS NOT NULL
         AND ps_away.pitches_thrown IS NOT NULL
     WHERE
       g.home_runs IS NOT NULL

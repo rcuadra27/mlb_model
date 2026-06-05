@@ -107,6 +107,9 @@ BIAS_CORRECTION_HOME = 0.0
 BIAS_CORRECTION_AWAY = 0.0
 TRAINING_LEAGUE_MEAN = 4.50
 
+# Min |predicted total − market O/U line| to emit OVER/UNDER; else NULL (no directional pick).
+OU_PRED_LINE_GAP = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Odds helpers
@@ -862,7 +865,10 @@ def main():
             p_over_l.append(po)
             p_under_l.append(pu)
             t = row["total_runs_pred"]
-            rec_l.append("OVER" if t > ou + 0.3 else "UNDER" if t < ou - 0.3 else "PUSH")
+            if abs(float(t) - float(ou)) < OU_PRED_LINE_GAP:
+                rec_l.append(None)
+            else:
+                rec_l.append("OVER" if float(t) > float(ou) else "UNDER")
         else:
             p_over_l.append(np.nan)
             p_under_l.append(np.nan)

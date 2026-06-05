@@ -88,7 +88,7 @@ def extract_from_pbp(feed: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]
 
 def get_starters(feed: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Optional[int], Optional[str], str]:
     home_id, home_name, away_id, away_name = extract_from_probables(feed)
-    if home_id is not None and away_id is not None:
+    if home_id is not None or away_id is not None:
         return home_id, home_name, away_id, away_name, "probablePitchers"
 
     h2, hn2, a2, an2 = extract_from_pbp(feed)
@@ -157,6 +157,13 @@ def main():
     ap.add_argument("--workers", type=int, default=12, help="thread workers (recommended 8-16)")
     ap.add_argument("--batch_size", type=int, default=500, help="db upsert batch size")
     ap.add_argument("--limit", type=int, default=None, help="optional limit for testing")
+    ap.add_argument(
+        "--game-id",
+        type=int,
+        action="append",
+        dest="game_ids_explicit",
+        help="refresh only these gamePk values (repeatable); skips global missing-starters scan",
+    )
     args = ap.parse_args()
 
     if not args.pg_dsn:
@@ -169,17 +176,26 @@ def main():
         dsn = "postgres://" + dsn[len("postgres+psycopg2://"):]
     conn = psycopg2.connect(dsn)
 
-    # Pull game_ids missing starters
-    q = """
-      SELECT g.game_id
-      FROM games g
-      LEFT JOIN game_starting_pitchers sp ON sp.game_id = g.game_id
-      WHERE sp.game_id IS NULL
-      ORDER BY g.game_date ASC;
-    """
-    with conn.cursor() as cur:
-        cur.execute(q)
-        game_ids = [int(r[0]) for r in cur.fetchall()]
+    if args.game_ids_explicit:
+        game_ids = sorted(set(int(g) for g in args.game_ids_explicit))
+        print(f"Explicit game_ids: {len(game_ids)} games")
+    else:
+        # Games with no starter row, or stale rows both names still null (bulk backfill skips
+        # sp.game_id present-but-empty; lineup-trigger uses explicit --game-id to refresh).
+        q = """
+          SELECT g.game_id
+          FROM games g
+          LEFT JOIN game_starting_pitchers sp ON sp.game_id = g.game_id
+          WHERE sp.game_id IS NULL
+             OR (
+               g.game_date >= (CURRENT_DATE - INTERVAL '2 days')
+               AND (sp.home_sp_name IS NULL OR sp.away_sp_name IS NULL)
+             )
+          ORDER BY g.game_date ASC, g.game_id ASC;
+        """
+        with conn.cursor() as cur:
+            cur.execute(q)
+            game_ids = [int(r[0]) for r in cur.fetchall()]
 
     if args.limit:
         game_ids = game_ids[: args.limit]

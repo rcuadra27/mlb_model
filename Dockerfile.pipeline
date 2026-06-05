@@ -16,8 +16,17 @@ COPY ingest/ ingest/
 COPY features/ features/
 COPY inference/ inference/
 COPY calibration/ calibration/
+COPY models/ models/
+ENV PYTHONPATH=/app
 COPY artifacts/runs_model_v9.joblib /app/artifacts/runs_model_v9.joblib
 COPY artifacts/runs_model_v9_features.txt /app/artifacts/runs_model_v9_features.txt
+COPY artifacts/baseline_v10_production.joblib /app/artifacts/baseline_v10_production.joblib
+COPY artifacts/totals_v10_umpire_runs_boost_sp_xwoba_total.joblib /app/artifacts/totals_v10_umpire_runs_boost_sp_xwoba_total.joblib
+COPY artifacts/props_v1_expanded.joblib /app/artifacts/props_v1_expanded.joblib
+COPY artifacts/pitcher_props_v1.joblib /app/artifacts/pitcher_props_v1.joblib
+COPY artifacts/pitcher_walks_v1.joblib /app/artifacts/pitcher_walks_v1.joblib
+COPY artifacts/pitcher_hits_v1.joblib /app/artifacts/pitcher_hits_v1.joblib
+COPY artifacts/pitcher_er_v1.joblib /app/artifacts/pitcher_er_v1.joblib
 COPY run_daily.sh .
 RUN chmod +x run_daily.sh
 CMD ["bash", "run_daily.sh", "build_features"]

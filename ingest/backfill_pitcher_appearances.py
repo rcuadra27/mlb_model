@@ -71,10 +71,12 @@ def extract_team_pitchers(feed: Dict[str, Any], side: str) -> Dict[int, Dict[str
         st = (p.get("stats", {}) or {}).get("pitching", {}) or {}
         ip = st.get("inningsPitched")
         outs = ip_str_to_outs(ip)
+        earned_runs = st.get("earnedRuns")
         out[int(pid)] = {
             "outs_pitched": outs,
             "innings_pitched": outs_to_ip(outs),
             "runs_allowed": int(st["runs"]) if st.get("runs") is not None else None,
+            "earned_runs": int(earned_runs) if earned_runs is not None else None,
         }
     return out
 
@@ -111,6 +113,7 @@ def process_game(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             "outs_pitched": st["outs_pitched"],
             "innings_pitched": st["innings_pitched"],
             "runs_allowed": st["runs_allowed"],
+            "earned_runs": st["earned_runs"],
             "is_starter": (home_sp is not None and pid == home_sp),
             "source": "mlb_feed_boxscore",
         })
@@ -127,6 +130,7 @@ def process_game(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             "outs_pitched": st["outs_pitched"],
             "innings_pitched": st["innings_pitched"],
             "runs_allowed": st["runs_allowed"],
+            "earned_runs": st["earned_runs"],
             "is_starter": (away_sp is not None and pid == away_sp),
             "source": "mlb_feed_boxscore",
         })
@@ -137,10 +141,22 @@ def process_game(row: Dict[str, Any]) -> List[Dict[str, Any]]:
 def upsert(conn, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'pitcher_appearances'
+        """)
+        existing = {r[0] for r in cur.fetchall()}
+        if "earned_runs" not in existing:
+            cur.execute("ALTER TABLE pitcher_appearances ADD COLUMN earned_runs INTEGER")
+            print("  Added column: earned_runs")
+    conn.commit()
+
     sql = """
     INSERT INTO pitcher_appearances (
       game_id, game_date, pitcher_id, team_id, opponent_team_id, is_home,
-      outs_pitched, innings_pitched, runs_allowed, is_starter, source
+      outs_pitched, innings_pitched, runs_allowed, earned_runs, is_starter, source
     )
     VALUES %s
     ON CONFLICT (game_id, pitcher_id) DO UPDATE SET
@@ -151,13 +167,14 @@ def upsert(conn, rows: List[Dict[str, Any]]) -> None:
       outs_pitched = EXCLUDED.outs_pitched,
       innings_pitched = EXCLUDED.innings_pitched,
       runs_allowed = EXCLUDED.runs_allowed,
+      earned_runs = EXCLUDED.earned_runs,
       is_starter = EXCLUDED.is_starter,
       source = EXCLUDED.source,
       updated_at = now();
     """
     values = [[
         r["game_id"], r["game_date"], r["pitcher_id"], r["team_id"], r["opponent_team_id"], r["is_home"],
-        r["outs_pitched"], r["innings_pitched"], r["runs_allowed"], r["is_starter"], r["source"]
+        r["outs_pitched"], r["innings_pitched"], r["runs_allowed"], r["earned_runs"], r["is_starter"], r["source"]
     ] for r in rows]
 
     with conn.cursor() as cur:
@@ -171,6 +188,7 @@ def main():
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--batch_size", type=int, default=2000)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--start", default=None, help="Reprocess from this date (YYYY-MM-DD)")
     args = ap.parse_args()
 
     if not args.pg_dsn:
@@ -183,8 +201,27 @@ def main():
         dsn = "postgres://" + dsn[len("postgres+psycopg2://"):]
     conn = psycopg2.connect(dsn)
 
-    # Only completed games; join starters so we can mark is_starter
-    q = """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'pitcher_appearances'
+        """)
+        existing = {r[0] for r in cur.fetchall()}
+        if "earned_runs" not in existing:
+            cur.execute("ALTER TABLE pitcher_appearances ADD COLUMN earned_runs INTEGER")
+            print("  Added column: earned_runs")
+    conn.commit()
+
+    date_filter = ""
+    params = {}
+    if args.start:
+        date_filter = "AND g.game_date >= %(start)s"
+        params["start"] = args.start
+
+    # Only completed games; join starters so we can mark is_starter.
+    # Reprocess games whose appearances are missing earned_runs so ERA can use true ER.
+    q = f"""
     SELECT
       g.game_id,
       g.game_date,
@@ -194,13 +231,16 @@ def main():
       sp.away_sp_id
     FROM games g
     JOIN game_starting_pitchers sp ON sp.game_id = g.game_id
-    LEFT JOIN pitcher_appearances pa ON pa.game_id = g.game_id
+    LEFT JOIN pitcher_appearances pa
+      ON pa.game_id = g.game_id
+      AND pa.earned_runs IS NOT NULL
     WHERE g.home_runs IS NOT NULL AND g.away_runs IS NOT NULL
       AND pa.game_id IS NULL
+      {date_filter}
     ORDER BY g.game_date, g.game_id;
     """
     with conn.cursor() as cur:
-        cur.execute(q)
+        cur.execute(q, params)
         raw = cur.fetchall()
 
     jobs = [{

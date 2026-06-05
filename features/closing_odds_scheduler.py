@@ -2,19 +2,19 @@
 """
 closing_odds_scheduler.py
 
-Polls The Odds API continuously from 3pm PT until all games have had
-their closing odds pulled 75 minutes before first pitch.
+Pulls closing odds once per game at T−75 minutes before first pitch.
+Morning odds come from market_movement.py (morning_inference); this script
+only hits The Odds API when at least one game enters its closing window.
 
-Each game gets its own closing pull timed to its specific first pitch.
-Also re-runs inference after each closing pull so predictions update
-with the latest market prices.
+Each GET /odds costs 2 credits (h2h + totals × us region). A 15-game slate
+with staggered first pitches typically needs ~5–15 calls, not 20–30+ polls.
 
 Usage:
     ODDS_API_KEY=... PG_DSN=... python closing_odds_scheduler.py --date 2026-04-01
     ODDS_API_KEY=... PG_DSN=... python closing_odds_scheduler.py  # defaults to today
 
-Cron: start at 3pm PT daily
-    0 15 * * * cd /path/to/mlb_model && ODDS_API_KEY=... PG_DSN=... python features/closing_odds_scheduler.py >> logs/closing_$(date +\%Y-\%m-\%d).log 2>&1
+Cron: start at 3pm PT daily (before earliest T−75 windows)
+    0 15 * * * cd /path/to/mlb_model && ODDS_API_KEY=... PG_DSN=... python features/closing_odds_scheduler.py >> logs/closing_$(date +\%Y-%m-%d).log 2>&1
 """
 
 import os
@@ -34,11 +34,8 @@ ODDS_API_SPORT = "baseball_mlb"
 PT             = pytz.timezone("America/Los_Angeles")
 
 CLOSING_WINDOW_MINUTES = 75
-# Default 10 min: each GET /odds costs ~1 credit; 5 min × many hours adds up fast.
-POLL_INTERVAL_SECONDS  = 900
+POLL_INTERVAL_SECONDS  = 900   # fallback retry / unknown first-pitch backoff
 MAX_RUNTIME_HOURS      = 8
-# When only waiting for the next T−closing_window pull, cap nap (still wake periodically).
-MAX_NAP_SECONDS        = 1800
 
 
 # ---------------------------------------------------------------------------
@@ -51,42 +48,6 @@ def american_to_implied(price: float) -> float:
     return 100.0 / (price + 100.0)
 
 
-def sleep_seconds_until_next_closing_pull(
-    now_utc: datetime,
-    games: pd.DataFrame,
-    pulled: set,
-    morning_done: set,
-    first_poll: bool,
-    poll_interval: int,
-    closing_window_minutes: int,
-    max_nap_seconds: int = MAX_NAP_SECONDS,
-) -> int:
-    """
-    Reduce Odds API usage: after morning lines are stored, avoid polling every poll_interval
-    while all remaining games are still far from the closing window.
-    """
-    if first_poll:
-        return poll_interval
-    if len(morning_done) < len(games):
-        return poll_interval
-    deadlines: list[datetime] = []
-    for _, g in games.iterrows():
-        if int(g["game_id"]) in pulled:
-            continue
-        fp = g["first_pitch_utc"]
-        if pd.isna(fp):
-            return poll_interval
-        close_at = fp - timedelta(minutes=closing_window_minutes)
-        deadlines.append(close_at)
-    if not deadlines:
-        return poll_interval
-    next_close = min(deadlines)
-    sec = (next_close - now_utc).total_seconds() - 90
-    if sec <= poll_interval:
-        return poll_interval
-    return int(min(max(sec, poll_interval), max_nap_seconds))
-
-
 def vig_free_prob(home_price: float, away_price: float) -> tuple[float, float]:
     p_home = american_to_implied(home_price)
     p_away = american_to_implied(away_price)
@@ -94,8 +55,22 @@ def vig_free_prob(home_price: float, away_price: float) -> tuple[float, float]:
     return p_home / total, p_away / total
 
 
-def fetch_all_odds(api_key: str) -> pd.DataFrame:
-    """Fetch current odds for all upcoming MLB games."""
+def _log_odds_api_usage(resp: requests.Response) -> int:
+    """Log and return quota cost from The Odds API response headers."""
+    try:
+        cost = int(resp.headers.get("x-requests-last", 0))
+    except (TypeError, ValueError):
+        cost = 0
+    remaining = resp.headers.get("x-requests-remaining")
+    msg = f"  Odds API cost: {cost or '?'} credit(s)"
+    if remaining is not None:
+        msg += f", {remaining} remaining this month"
+    print(msg)
+    return cost or 2
+
+
+def fetch_all_odds(api_key: str) -> tuple[pd.DataFrame, int]:
+    """Fetch current odds for all upcoming MLB games (2 credits: h2h + totals)."""
     params = {
         "apiKey":    api_key,
         "regions":   "us",
@@ -106,10 +81,11 @@ def fetch_all_odds(api_key: str) -> pd.DataFrame:
     try:
         resp = requests.get(ODDS_API_BASE, params=params, timeout=15)
         resp.raise_for_status()
+        cost = _log_odds_api_usage(resp)
         games = resp.json()
     except Exception as e:
         print(f"  Odds API error: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
 
     now_utc = pd.Timestamp.now(tz="UTC")
     records = []
@@ -117,7 +93,6 @@ def fetch_all_odds(api_key: str) -> pd.DataFrame:
         home_team = g.get("home_team", "")
         away_team = g.get("away_team", "")
         commence  = g.get("commence_time", "")
-        # Skip games that have already started — never use live odds
         if commence:
             commence_utc = pd.to_datetime(commence, utc=True)
             if commence_utc <= now_utc:
@@ -153,14 +128,13 @@ def fetch_all_odds(api_key: str) -> pd.DataFrame:
             "commence_time":    commence,
             "p_home_fair":      p_home,
             "p_away_fair":      p_away,
-            # Raw consensus American prices (median across books)
             "home_price_raw":   int(round(home_med)) if not np.isnan(home_med) else None,
             "away_price_raw":   int(round(away_med)) if not np.isnan(away_med) else None,
             "ou_line":          float(np.median(ou_lines)) if ou_lines else np.nan,
             "n_books":          len(ml_h),
         })
 
-    return pd.DataFrame(records)
+    return pd.DataFrame(records), cost
 
 
 # ---------------------------------------------------------------------------
@@ -182,36 +156,53 @@ def match_game_to_odds(home_team: str, away_team: str,
     return None
 
 
-# ---------------------------------------------------------------------------
-# Store morning odds (first poll of the day)
-# ---------------------------------------------------------------------------
+def closing_deadline(first_pitch_utc, closing_window_minutes: int):
+    if pd.isna(first_pitch_utc):
+        return None
+    return first_pitch_utc - timedelta(minutes=closing_window_minutes)
 
-def store_morning_odds(engine, schema: str, game_id: int, odds: dict) -> None:
-    """Store morning odds including raw American prices."""
-    p_home      = odds.get("p_home_fair")
-    ou          = odds.get("ou_line")
-    home_price  = odds.get("home_price_raw")
-    away_price  = odds.get("away_price_raw")
 
-    if p_home is None:
-        return
+def games_due_for_closing(
+    games: pd.DataFrame,
+    pulled: set,
+    now_utc: datetime,
+    closing_window_minutes: int,
+) -> list[pd.Series]:
+    due = []
+    for _, game in games.iterrows():
+        game_id = int(game["game_id"])
+        if game_id in pulled:
+            continue
+        fp_utc = game["first_pitch_utc"]
+        if pd.isna(fp_utc):
+            due.append(game)
+            continue
+        minutes_to_game = (fp_utc - now_utc).total_seconds() / 60
+        if minutes_to_game <= closing_window_minutes:
+            due.append(game)
+    return due
 
-    with engine.begin() as conn:
-        conn.execute(text(f"""
-            UPDATE {schema}.features_game
-            SET morning_p_home    = :ph,
-                morning_ou_line   = :ou,
-                morning_home_price = :hp,
-                morning_away_price = :ap
-            WHERE game_id = :gid
-              AND morning_p_home IS NULL
-        """), {
-            "ph":  float(p_home),
-            "ou":  float(ou) if ou and not np.isnan(ou) else None,
-            "hp":  home_price,
-            "ap":  away_price,
-            "gid": game_id,
-        })
+
+def seconds_until_next_closing_deadline(
+    games: pd.DataFrame,
+    pulled: set,
+    now_utc: datetime,
+    closing_window_minutes: int,
+) -> float | None:
+    """Seconds until the next unpulled game enters its closing window."""
+    upcoming = []
+    for _, game in games.iterrows():
+        game_id = int(game["game_id"])
+        if game_id in pulled:
+            continue
+        deadline = closing_deadline(game["first_pitch_utc"], closing_window_minutes)
+        if deadline is None:
+            return 0.0
+        if deadline > now_utc:
+            upcoming.append(deadline)
+    if not upcoming:
+        return None
+    return max(0.0, (min(upcoming) - now_utc).total_seconds())
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +236,6 @@ def store_closing_odds(engine, schema: str, game_id: int, odds: dict) -> None:
             "gid": game_id,
         })
 
-        # Compute and store line movement
         conn.execute(text(f"""
             UPDATE {schema}.features_game
             SET home_line_move      = closing_p_home - morning_p_home,
@@ -265,38 +255,41 @@ def store_closing_odds(engine, schema: str, game_id: int, odds: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Re-run inference after closing pull
+# Re-run inference after all closing pulls
 # ---------------------------------------------------------------------------
 
-def rerun_inference(date_str: str, model_path: str, features_path: str) -> None:
-    cmd = [
-        sys.executable, "inference/inference.py",
-        "--date",          date_str,
-        "--team_model",    model_path,
-        "--team_features", features_path,
-        "--no_calibrate",
-        "--fill_missing",
+def rerun_inference(date_str: str, ml_model_path: str, total_model_path: str) -> None:
+    cmds = [
+        [
+            sys.executable, "inference/inference_v10.py",
+            "--date", date_str,
+            "--model", ml_model_path,
+            "--fill_missing",
+        ],
+        [
+            sys.executable, "inference/inference_v10_total.py",
+            "--date", date_str,
+            "--model", total_model_path,
+        ],
+        [
+            sys.executable, "export_to_bigquery.py",
+            "--date", date_str,
+        ],
     ]
-    print(f"  Re-running inference for {date_str}...")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
+    print(f"  Re-running v10 inference + export for {date_str}...")
+    for cmd in cmds:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if result.returncode != 0:
+                print(f"  {' '.join(cmd[:2])} error: {result.stderr[:200]}")
+                return
             for line in result.stdout.split("\n"):
-                if any(k in line for k in ["Saved", "games", "ALL GAMES", "VALUE BETS", "No value"]):
+                if any(k in line for k in ["Saved", "games", "Updated", "Exported", "Wrote"]):
                     print(f"    {line}")
-            # Export to BigQuery after successful inference
-            export_cmd = [sys.executable, "export_to_bigquery.py", "--date", date_str]
-            export_result = subprocess.run(export_cmd, capture_output=True, text=True, timeout=120)
-            if export_result.returncode == 0:
-                print(f"    ✓ Exported to BigQuery")
-            else:
-                print(f"  Export error: {export_result.stderr[:200]}")
-        else:
-            print(f"  Inference error: {result.stderr[:200]}")
-    except subprocess.TimeoutExpired:
-        print("  Inference timed out after 120s")
-    except Exception as e:
-        print(f"  Inference subprocess error: {e}")
+        except subprocess.TimeoutExpired:
+            print(f"  {' '.join(cmd[:2])} timed out")
+            return
+    print("    ✓ Closing inference + export complete")
 
 
 # ---------------------------------------------------------------------------
@@ -341,22 +334,29 @@ def get_games_with_first_pitch(engine, schema: str, date_str: str) -> pd.DataFra
 # Main scheduler loop
 # ---------------------------------------------------------------------------
 
-def run_scheduler(engine, schema: str, date_str: str, api_key: str,
-                  model_path: str, features_path: str,
-                  poll_interval: int = POLL_INTERVAL_SECONDS,
-                  closing_window_minutes: int = CLOSING_WINDOW_MINUTES) -> None:
+def run_scheduler(
+    engine,
+    schema: str,
+    date_str: str,
+    api_key: str,
+    ml_model_path: str,
+    total_model_path: str,
+    poll_interval: int = POLL_INTERVAL_SECONDS,
+    closing_window_minutes: int = CLOSING_WINDOW_MINUTES,
+) -> None:
 
     print(f"\n{'='*60}")
     print(f"  Closing Odds Scheduler — {date_str}")
-    print(f"  Pulling odds {closing_window_minutes} min before first pitch")
-    print(f"  Base poll interval {poll_interval}s (longer naps when only waiting on clock)")
+    print(f"  One API call per closing window (T−{closing_window_minutes} min)")
+    print(f"  Morning odds: market_movement.py (not duplicated here)")
     print(f"{'='*60}\n")
 
-    games         = get_games_with_first_pitch(engine, schema, date_str)
-    pulled        = set()
-    morning_done  = set()
-    start_ts      = datetime.now(timezone.utc)
-    max_end       = start_ts + timedelta(hours=MAX_RUNTIME_HOURS)
+    games    = get_games_with_first_pitch(engine, schema, date_str)
+    pulled   = set()
+    api_calls = 0
+    credits   = 0
+    start_ts  = datetime.now(timezone.utc)
+    max_end   = start_ts + timedelta(hours=MAX_RUNTIME_HOURS)
 
     if games.empty:
         print(f"  No games found for {date_str} — exiting")
@@ -367,12 +367,11 @@ def run_scheduler(engine, schema: str, date_str: str, api_key: str,
         fp = g["first_pitch_utc"]
         if pd.notna(fp):
             fp_pt = fp.astimezone(PT).strftime("%I:%M%p PT")
-            print(f"    {g['away_team']} @ {g['home_team']} — first pitch {fp_pt}")
+            close_pt = (fp - timedelta(minutes=closing_window_minutes)).astimezone(PT).strftime("%I:%M%p PT")
+            print(f"    {g['away_team']} @ {g['home_team']} — pitch {fp_pt}, close pull ~{close_pt}")
         else:
-            print(f"    {g['away_team']} @ {g['home_team']} — time unknown")
+            print(f"    {g['away_team']} @ {g['home_team']} — time unknown (pull on first wake)")
     print()
-
-    first_poll = True
 
     while True:
         now_utc    = datetime.now(timezone.utc)
@@ -382,81 +381,55 @@ def run_scheduler(engine, schema: str, date_str: str, api_key: str,
             print(f"  Max runtime ({MAX_RUNTIME_HOURS}h) reached — exiting")
             break
 
-        remaining = [g for _, g in games.iterrows() if int(g["game_id"]) not in pulled]
-        if not remaining:
+        if len(pulled) == len(games):
             print(f"  [{now_pt_str}] All games processed — scheduler complete")
             break
 
-        print(f"  [{now_pt_str}] Polling — {len(remaining)} games remaining...")
-        df_odds = fetch_all_odds(api_key)
+        due = games_due_for_closing(games, pulled, now_utc, closing_window_minutes)
+        if not due:
+            wait = seconds_until_next_closing_deadline(
+                games, pulled, now_utc, closing_window_minutes,
+            )
+            if wait is None:
+                break
+            nap = int(min(max(wait, 30), poll_interval * 4, (max_end - now_utc).total_seconds()))
+            remaining = len(games) - len(pulled)
+            print(f"  [{now_pt_str}] Waiting for next closing window — "
+                  f"{remaining} games left, sleep {nap}s")
+            time.sleep(nap)
+            continue
+
+        print(f"  [{now_pt_str}] {len(due)} game(s) due — fetching odds...")
+        df_odds, cost = fetch_all_odds(api_key)
+        api_calls += 1
+        credits += cost
 
         if df_odds.empty:
-            err_sleep = min(max(poll_interval * 2, 600), 3600)
+            err_sleep = min(max(poll_interval, 600), 3600)
             print(f"    No odds returned — will retry in {err_sleep}s")
             time.sleep(err_sleep)
             continue
 
-        newly_pulled = []
-
-        for _, game in games.iterrows():
+        for game in due:
             game_id = int(game["game_id"])
-            if game_id in pulled:
-                continue
-
             odds = match_game_to_odds(game["home_team"], game["away_team"], df_odds)
             if odds is None:
-                continue
-
-            # Store morning odds on first poll
-            if first_poll and game_id not in morning_done:
-                store_morning_odds(engine, schema, game_id, odds)
-                morning_done.add(game_id)
-                print(f"    Morning odds stored: {game['away_team']} @ {game['home_team']} "
-                      f"away={odds.get('away_price_raw')} home={odds.get('home_price_raw')}")
-
-            fp_utc = game["first_pitch_utc"]
-            should_pull = False
-            if pd.isna(fp_utc):
-                should_pull = True
-            else:
-                minutes_to_game = (fp_utc - now_utc).total_seconds() / 60
-                if minutes_to_game <= closing_window_minutes:
-                    should_pull = True
-                    print(f"    {game['away_team']} @ {game['home_team']}: "
-                          f"{minutes_to_game:.0f} min to first pitch — pulling closing odds")
-                else:
-                    print(f"    {game['away_team']} @ {game['home_team']}: "
-                          f"waiting ({minutes_to_game:.0f} min to first pitch)")
-
-            if not should_pull:
+                print(f"    ✗ No odds match: {game['away_team']} @ {game['home_team']}")
                 continue
 
             store_closing_odds(engine, schema, game_id, odds)
-
+            pulled.add(game_id)
             print(f"    ✓ {game['away_team']} @ {game['home_team']}: "
                   f"p_home={odds.get('p_home_fair', 0):.3f} "
                   f"away={odds.get('away_price_raw')} home={odds.get('home_price_raw')} "
                   f"ou={odds.get('ou_line', '—')} n_books={odds.get('n_books', 0)}")
 
-            pulled.add(game_id)
-            newly_pulled.append(game_id)
+    if pulled:
+        rerun_inference(date_str, ml_model_path, total_model_path)
 
-        if newly_pulled:
-            rerun_inference(date_str, model_path, features_path)
-
-        if len(pulled) == len(games):
-            print(f"\n  [{now_pt_str}] All {len(games)} games processed ✓")
-            break
-
-        nap = sleep_seconds_until_next_closing_pull(
-            now_utc, games, pulled, morning_done, first_poll,
-            poll_interval, closing_window_minutes,
-        )
-        first_poll = False
-        print(f"    Sleeping {nap}s...\n")
-        time.sleep(nap)
-
-    print("\n  Scheduler finished.")
+    print(f"\n  Scheduler finished — {api_calls} API call(s), ~{credits} credit(s) used for closing")
+    if len(pulled) < len(games):
+        print(f"  Warning: only {len(pulled)}/{len(games)} games got closing odds")
 
 
 # ---------------------------------------------------------------------------
@@ -467,10 +440,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date",           default=pd.Timestamp.today().strftime("%Y-%m-%d"))
     ap.add_argument("--schema",         default="public")
-    ap.add_argument("--model",          default="artifacts/runs_model_v8.joblib")
-    ap.add_argument("--features",       default="artifacts/runs_model_v8_features.txt")
+    ap.add_argument("--model",          default="artifacts/baseline_v10_production.joblib",
+                    help="v10 moneyline model for post-closing inference")
+    ap.add_argument("--total_model",    default="artifacts/totals_v10_umpire_runs_boost_sp_xwoba_total.joblib",
+                    help="v10 totals model for post-closing inference")
     ap.add_argument("--minutes_before", type=int, default=CLOSING_WINDOW_MINUTES)
-    ap.add_argument("--poll_interval",  type=int, default=POLL_INTERVAL_SECONDS)
+    ap.add_argument("--poll_interval",  type=int, default=POLL_INTERVAL_SECONDS,
+                    help="Retry backoff when API fails or first_pitch unknown")
     args = ap.parse_args()
 
     pg_dsn  = os.getenv("PG_DSN")
@@ -488,8 +464,8 @@ def main():
         schema                 = args.schema,
         date_str               = args.date,
         api_key                = api_key,
-        model_path             = args.model,
-        features_path          = args.features,
+        ml_model_path          = args.model,
+        total_model_path       = args.total_model,
         poll_interval          = args.poll_interval,
         closing_window_minutes = args.minutes_before,
     )

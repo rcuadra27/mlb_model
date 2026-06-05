@@ -5,9 +5,10 @@ ingest_lineups.py
 Polls the MLB Stats API continuously from 6am PT, checking for confirmed
 lineups per game. As soon as BOTH home and away lineups are confirmed for
 a game, immediately triggers:
-    1. features/build_features1.py --date <date>
-    2. inference/inference.py --date <date>
-    3. export_to_bigquery.py --date <date>
+    1. ingest/backfill_startingpitchers.py --game-id … (probable SP names for those games)
+    2. features/build_features1.py --date <date>
+    3. inference (v10 ML + props; no totals recompute)
+    4. targeted BQ export (props + edges + lineup_refresh merge — never full daily_games truncate)
     → game appears on dashboard
 
 Each game is triggered independently as its lineup confirms, so early
@@ -27,6 +28,8 @@ import sys
 import time
 import argparse
 import subprocess
+from typing import List, Optional
+
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -39,8 +42,7 @@ MAX_RUNTIME_HOURS    = 16    # safety cutoff — covers all games including late
 MLB_BOXSCORE_URL     = "https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
 MLB_SCHEDULE_URL     = "https://statsapi.mlb.com/api/v1/schedule"
 
-MODEL_PATH    = "artifacts/runs_model_v9.joblib"
-FEATURES_PATH = "artifacts/runs_model_v9_features.txt"
+MODEL_PATH    = "artifacts/baseline_v10_production.joblib"
 
 
 # ---------------------------------------------------------------------------
@@ -174,15 +176,29 @@ def upsert_lineups(engine, schema: str, rows: list, date_str: str) -> None:
 # Inference chain — triggered per game as lineup confirms
 # ---------------------------------------------------------------------------
 
-def run_inference_chain(date_str: str, schema: str) -> None:
+def run_inference_chain(
+    date_str: str,
+    schema: str,
+    starter_refresh_ids: Optional[List[int]] = None,
+) -> None:
     """
-    Run build_features → inference → export for the given date.
-    Called immediately when a new game's lineup confirms.
-    Safe to run multiple times — all scripts are idempotent.
-    """
-    print(f"  → Running inference chain for {date_str}...")
+    Run lineup-dependent refresh for confirmed games only.
 
-    steps = [
+    Does NOT run inference_v10_total or full daily_games export — morning inference
+    owns totals/run-split; this chain updates ML/props and merges those rows into BQ.
+    """
+    print(f"  → Running lineup refresh chain for {date_str}...")
+    gids = sorted(set(starter_refresh_ids or []))
+    if not gids:
+        print("  No game_ids — skipping chain")
+        return
+
+    steps = []
+    cmd = [sys.executable, "ingest/backfill_startingpitchers.py"]
+    for gid in gids:
+        cmd.extend(["--game-id", str(gid)])
+    steps.append({"name": "backfill_probable_pitchers", "cmd": cmd})
+    steps.extend([
         {
             "name": "build_features",
             "cmd": [
@@ -209,25 +225,63 @@ def run_inference_chain(date_str: str, schema: str) -> None:
             ]
         },
         {
-            "name": "inference",
+            "name": "inference_v10",
             "cmd": [
-                sys.executable, "inference/inference.py",
+                sys.executable, "inference/inference_v10.py",
                 "--date", date_str,
-                "--team_model",    MODEL_PATH,
-                "--team_features", FEATURES_PATH,
-                "--no_calibrate",
+                "--model", MODEL_PATH,
                 "--fill_missing",
             ]
         },
         {
-            "name": "export_to_bigquery",
+            "name": "inference_props",
             "cmd": [
-                sys.executable, "export_to_bigquery.py",
+                sys.executable, "inference/inference_props_v1.py",
+                "--date", date_str,
+                "--batter-model", "artifacts/props_v1_expanded.joblib",
+                "--pitcher-model", "artifacts/pitcher_props_v1.joblib",
+                "--pitcher-walks-model", "artifacts/pitcher_walks_v1.joblib",
+                "--pitcher-hits-model", "artifacts/pitcher_hits_v1.joblib",
+                "--pitcher-er-model", "artifacts/pitcher_er_v1.joblib",
+            ]
+        },
+        {
+            "name": "build_edges",
+            "cmd": [
+                sys.executable, "features/build_edges.py",
                 "--date", date_str,
                 "--schema", schema,
             ]
         },
-    ]
+        {
+            "name": "export_props",
+            "cmd": [
+                sys.executable, "export_to_bigquery.py",
+                "--date", date_str,
+                "--schema", schema,
+                "--only", "props",
+            ]
+        },
+        {
+            "name": "export_edges",
+            "cmd": [
+                sys.executable, "export_to_bigquery.py",
+                "--date", date_str,
+                "--schema", schema,
+                "--only", "edges",
+            ]
+        },
+        {
+            "name": "export_lineup_refresh",
+            "cmd": [
+                sys.executable, "export_to_bigquery.py",
+                "--date", date_str,
+                "--schema", schema,
+                "--only", "lineup_refresh",
+                "--game-ids", ",".join(str(g) for g in gids),
+            ]
+        },
+    ])
 
     env = os.environ.copy()
 
@@ -246,7 +300,8 @@ def run_inference_chain(date_str: str, schema: str) -> None:
                 for line in result.stdout.split("\n"):
                     if any(k in line for k in [
                         "Saved", "games", "Exported", "predictions",
-                        "Value bets", "No value", "Found"
+                        "Value bets", "No value", "Found",
+                        "DONE", "Explicit game_ids",
                     ]):
                         print(f"      {line.strip()}")
                 print(f"    ✓ {step['name']} complete")
@@ -313,7 +368,7 @@ def run_scheduler(engine, schema: str, date_str: str) -> None:
         # Run inference chain whenever new lineups come in
         if newly_confirmed:
             print(f"\n  {len(newly_confirmed)} new lineup(s) confirmed → triggering inference chain")
-            run_inference_chain(date_str, schema)
+            run_inference_chain(date_str, schema, starter_refresh_ids=newly_confirmed)
             chain_ran = True
             print()
 
@@ -330,6 +385,33 @@ def run_scheduler(engine, schema: str, date_str: str) -> None:
     print(f"\n  Lineup scheduler finished. {len(confirmed)}/{len(game_ids)} games confirmed.")
 
 
+def run_once(engine, schema: str, date_str: str) -> None:
+    """Fetch lineups once (no polling) — used by morning_inference before props run."""
+    print(f"\n{'='*60}")
+    print(f"  Lineup ingest (one-shot) — {date_str}")
+    print(f"{'='*60}\n")
+
+    game_ids = fetch_game_ids_for_date(date_str)
+    if not game_ids:
+        print(f"  No games found for {date_str} — exiting")
+        return
+
+    confirmed = []
+    for game_id in game_ids:
+        rows = fetch_lineup_for_game(game_id)
+        if rows:
+            upsert_lineups(engine, schema, rows, date_str)
+            confirmed.append(game_id)
+            home = [r["player_name"] for r in rows if r["is_home"]]
+            away = [r["player_name"] for r in rows if not r["is_home"]]
+            print(f"    ✓ game_id={game_id}: lineup confirmed "
+                  f"({len(away)} away, {len(home)} home batters)")
+        else:
+            print(f"    — game_id={game_id}: not yet posted")
+
+    print(f"\n  One-shot complete: {len(confirmed)}/{len(game_ids)} games with lineups.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -338,6 +420,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--date",   default=pd.Timestamp.today().strftime("%Y-%m-%d"))
     ap.add_argument("--schema", default="public")
+    ap.add_argument("--once",   action="store_true",
+                    help="Fetch lineups once and exit (no polling loop)")
     args = ap.parse_args()
 
     pg_dsn = os.getenv("PG_DSN")
@@ -346,4 +430,7 @@ if __name__ == "__main__":
 
     engine = create_engine(pg_dsn, pool_pre_ping=True)
     ensure_lineup_columns(engine, args.schema)
-    run_scheduler(engine, args.schema, args.date)
+    if args.once:
+        run_once(engine, args.schema, args.date)
+    else:
+        run_scheduler(engine, args.schema, args.date)

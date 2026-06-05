@@ -1,0 +1,13 @@
+name: agent_chat_estimated_cost_usd
+description: Estimated Anthropic USD per mlb-agent-chat request (AGENT_CHAT_USAGE JSON logs)
+filter: 'resource.type="cloud_run_revision" AND resource.labels.service_name="mlb-agent-chat" AND jsonPayload.event="AGENT_CHAT_USAGE"'
+valueExtractor: EXTRACT(jsonPayload.estimated_cost_usd)
+metricDescriptor:
+  metricKind: DELTA
+  valueType: DISTRIBUTION
+  unit: USD
+bucketOptions:
+  linearBuckets:
+    numFiniteBuckets: 100
+    width: 0.01
+    offset: 0

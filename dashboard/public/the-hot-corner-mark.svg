@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" role="img" aria-label="The Hot Corner">
+  <defs>
+    <radialGradient id="topGlow" cx="20" cy="8" r="14" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F59E0B" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#F59E0B" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="20" cy="8" r="10" fill="url(#topGlow)"/>
+  <path d="M20 2 L38 20 L20 20 L2 20 Z" fill="#F59E0B"/>
+  <path d="M38 20 L20 38 L20 20 Z" fill="#374151"/>
+  <path d="M20 38 L2 20 L20 20 Z" fill="#1F2937"/>
+  <path d="M2 20 L20 2 L20 20 Z" fill="#4B5563"/>
+</svg>

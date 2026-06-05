@@ -49,6 +49,10 @@ mlb_model_env.yml
 # Model artifacts (large files)
 artifacts/*.txt
 artifacts/*.joblib
+artifacts/*_eval.csv
+
+# Auto-written by scripts/pin_pipeline_jobs.sh
+config/production_image.env
 
 # Dashboard build output
 dashboard/dist/

@@ -1,5 +1,16 @@
 steps:
 - name: 'gcr.io/cloud-builders/docker'
-  args: ['build', '-t', 'gcr.io/mlb-model-491223/mlb-model', '-f', 'Dockerfile.pipeline', '.']
+  args: ['build', '-t', 'gcr.io/mlb-model-491223/mlb-model:latest', '-f', 'Dockerfile.pipeline', '.']
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      DIGEST=$$(gcloud container images describe gcr.io/mlb-model-491223/mlb-model:latest --format='value(image_summary.digest)')
+      mkdir -p config
+      printf 'PRODUCTION_IMAGE=gcr.io/mlb-model-491223/mlb-model@%s\nPRODUCTION_IMAGE_DIGEST=%s\nBUILT_AT=%s\n' \
+        "$$DIGEST" "$$DIGEST" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > config/production_image.env
+      echo "Recorded production digest $$DIGEST"
 images:
-- 'gcr.io/mlb-model-491223/mlb-model'
+- 'gcr.io/mlb-model-491223/mlb-model:latest'

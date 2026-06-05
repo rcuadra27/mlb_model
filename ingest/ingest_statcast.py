@@ -23,6 +23,7 @@ import os
 import argparse
 import io
 import time
+import hashlib
 import requests
 import pandas as pd
 import numpy as np
@@ -30,18 +31,15 @@ from sqlalchemy import create_engine, text
 
 SAVANT_URL = "https://baseballsavant.mlb.com/statcast_search/csv"
 
-# Columns we need from Baseball Savant
+# Columns we need from Baseball Savant (aligned with statcast_pitches table)
 SAVANT_COLS = [
-    "game_date", "pitcher", "batter", "pitch_type", "events",
-    "bb_type", "estimated_woba_using_speedangle",
-    "woba_denom", "launch_speed", "launch_angle",
-    "home_team", "away_team", "inning_topbot",
+    "game_date", "game_pk", "at_bat_number", "pitch_number",
+    "pitcher", "batter", "stand", "p_throws",
+    "pitch_type", "events", "bb_type",
+    "estimated_woba_using_speedangle", "woba_denom",
+    "launch_speed", "launch_angle",
+    "home_team", "away_team", "inning", "inning_topbot",
 ]
-
-# Map from savant column names to DB column names
-COL_MAP = {
-    "estimated_woba_using_speedangle": "xwoba",
-}
 
 # Pitch type normalization
 PITCH_TYPE_MAP = {
@@ -49,6 +47,19 @@ PITCH_TYPE_MAP = {
     "CU": "CU", "CH": "CH", "SP": "SP", "FS": "FS",
     "KC": "CU", "ST": "SL", "SV": "SL", "CS": "CU",
 }
+
+
+def make_row_id(df: pd.DataFrame) -> pd.Series:
+    """Deterministic row key — must match ingest/statcast_pitches.py."""
+    keys = (
+        df["game_date"].astype(str).fillna("") + "|" +
+        df["game_pk"].astype("Int64").astype(str).fillna("") + "|" +
+        df["at_bat_number"].astype("Int64").astype(str).fillna("") + "|" +
+        df["pitch_number"].astype("Int64").astype(str).fillna("") + "|" +
+        df["pitcher"].astype("Int64").astype(str).fillna("") + "|" +
+        df["batter"].astype("Int64").astype(str).fillna("")
+    )
+    return keys.map(lambda s: hashlib.md5(s.encode("utf-8")).hexdigest())
 
 
 def fetch_statcast_for_date(date_str: str) -> pd.DataFrame:
@@ -126,13 +137,11 @@ def clean_statcast(df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in SAVANT_COLS if c in df.columns]
     df = df[keep].copy()
 
-    # Rename columns
-    df = df.rename(columns=COL_MAP)
-
     # Normalize types
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    df["pitcher"]   = pd.to_numeric(df["pitcher"], errors="coerce").astype("Int64")
-    df["batter"]    = pd.to_numeric(df["batter"],  errors="coerce").astype("Int64")
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce").dt.date
+    for col in ["game_pk", "at_bat_number", "pitch_number", "pitcher", "batter", "inning"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
     # Normalize pitch types
     if "pitch_type" in df.columns:
@@ -141,14 +150,18 @@ def clean_statcast(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     # Numeric columns
-    for col in ["xwoba", "woba_denom", "launch_speed", "launch_angle"]:
+    for col in ["estimated_woba_using_speedangle", "woba_denom", "launch_speed", "launch_angle"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop rows with null pitcher or batter
-    df = df.dropna(subset=["pitcher", "batter", "game_date"])
+    # Drop rows missing identifiers required for row_id + dedup
+    required = ["pitcher", "batter", "game_date", "game_pk", "at_bat_number", "pitch_number"]
+    df = df.dropna(subset=[c for c in required if c in df.columns])
+    if df.empty:
+        return df
 
-    return df
+    df["row_id"] = make_row_id(df)
+    return df.dropna(subset=["row_id"])
 
 
 def upsert_statcast(engine, schema: str, df: pd.DataFrame) -> None:
@@ -165,8 +178,8 @@ def upsert_statcast(engine, schema: str, df: pd.DataFrame) -> None:
         )["column_name"].tolist()
 
     insert_cols = [c for c in df.columns if c in db_cols]
-    if not insert_cols:
-        print("  No matching columns found in statcast_pitches table")
+    if "row_id" not in insert_cols:
+        print("  row_id missing — cannot insert into statcast_pitches")
         return
 
     df_insert = df[insert_cols].copy()
@@ -194,7 +207,7 @@ def upsert_statcast(engine, schema: str, df: pd.DataFrame) -> None:
             result = conn.execute(text(f"""
                 INSERT INTO {schema}.statcast_pitches ({col_str})
                 SELECT {col_str} FROM {schema}._statcast_tmp
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (row_id) DO NOTHING
             """))
             conn.execute(text(f"DROP TABLE IF EXISTS {schema}._statcast_tmp"))
             total_inserted += result.rowcount

@@ -1253,6 +1253,8 @@ def main():
     ap.add_argument("--batch-days",    type=int, default=30)
     ap.add_argument("--skip-statcast", action="store_true",
                     help="Skip statcast computation (park factors and team stats only)")
+    ap.add_argument("--statcast-only", action="store_true",
+                    help="Only statcast SP/lineup block (skip park/league/team rolling)")
     args = ap.parse_args()
 
     pg_dsn = os.getenv("PG_DSN")
@@ -1272,20 +1274,25 @@ def main():
     print("\nEnsuring columns exist...")
     ensure_columns(engine, args.schema)
 
-    print("\nComputing park factors...")
-    upsert_park_factors(engine, args.schema, start_date, end_date)
-
-    print("\nComputing league average runs...")
-    upsert_league_avg_runs(engine, args.schema, start_date, end_date)
-
-    print("\nComputing team rolling stats (30d, 60d)...")
-    upsert_team_rolling_stats(engine, args.schema, start_date, end_date)
-
-    if not args.skip_statcast:
+    if args.statcast_only:
+        print("\nStatcast-only mode — SP/lineup features for date range...")
         process_date_range(engine, args.schema, start_date, end_date,
                            batch_days=args.batch_days)
     else:
-        print("Skipping statcast computation (--skip-statcast).")
+        print("\nComputing park factors...")
+        upsert_park_factors(engine, args.schema, start_date, end_date)
+
+        print("\nComputing league average runs...")
+        upsert_league_avg_runs(engine, args.schema, start_date, end_date)
+
+        print("\nComputing team rolling stats (30d, 60d)...")
+        upsert_team_rolling_stats(engine, args.schema, start_date, end_date)
+
+        if not args.skip_statcast:
+            process_date_range(engine, args.schema, start_date, end_date,
+                               batch_days=args.batch_days)
+        else:
+            print("Skipping statcast computation (--skip-statcast).")
 
     print("\nAll done.")
 

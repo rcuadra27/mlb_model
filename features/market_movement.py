@@ -56,8 +56,47 @@ def vig_free_prob(home_price: float, away_price: float) -> tuple[float, float]:
     return p_home / total, p_away / total
 
 
+def _log_odds_api_usage(resp: requests.Response) -> None:
+    """Log quota cost from The Odds API response headers."""
+    last = resp.headers.get("x-requests-last")
+    remaining = resp.headers.get("x-requests-remaining")
+    used = resp.headers.get("x-requests-used")
+    parts = []
+    if last is not None:
+        parts.append(f"cost {last} credit(s)")
+    if remaining is not None:
+        parts.append(f"{remaining} remaining this month")
+    if used is not None:
+        parts.append(f"{used} used this month")
+    if parts:
+        print(f"  Odds API: {', '.join(parts)}")
+
+
+def _odds_api_failure(resp: requests.Response) -> str | None:
+    """Human-readable failure when Odds API rejects the request."""
+    _log_odds_api_usage(resp)
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    if isinstance(body, dict):
+        code = body.get("error_code") or ""
+        msg = body.get("message") or ""
+        if code == "OUT_OF_USAGE_CREDITS" or "quota" in msg.lower():
+            return (
+                "Odds API monthly quota exhausted (OUT_OF_USAGE_CREDITS). "
+                "Restore credits on the account tied to ODDS_API_KEY, then re-run market_movement."
+            )
+    if resp.status_code == 401:
+        return (
+            "Odds API returned 401 Unauthorized — key invalid or quota exhausted. "
+            "Check the-odds-api.com usage for this API key."
+        )
+    return None
+
+
 def fetch_current_odds(api_key: str, date_str: str) -> pd.DataFrame:
-    """Fetch current h2h + totals odds from The Odds API."""
+    """Fetch current h2h + totals odds from The Odds API (2 credits: h2h + totals × us)."""
     params = {
         "apiKey":    api_key,
         "regions":   "us",
@@ -67,8 +106,16 @@ def fetch_current_odds(api_key: str, date_str: str) -> pd.DataFrame:
     }
     try:
         resp = requests.get(ODDS_API_BASE, params=params, timeout=10)
-        resp.raise_for_status()
+        if not resp.ok:
+            detail = _odds_api_failure(resp)
+            if detail:
+                print(f"  PIPELINE_ALERT severity=critical job=market_movement {detail}")
+                raise RuntimeError(detail)
+            resp.raise_for_status()
+        _log_odds_api_usage(resp)
         games = resp.json()
+    except RuntimeError:
+        raise
     except Exception as e:
         print(f"  Odds API error: {e}")
         return pd.DataFrame()
@@ -80,7 +127,7 @@ def fetch_current_odds(api_key: str, date_str: str) -> pd.DataFrame:
         away_team = g.get("away_team", "")
 
         ml_h, ml_a = [], []
-        ou_lines, ou_prices = [], []
+        ou_lines = []
 
         for bk in g.get("bookmakers", []):
             for mkt in bk.get("markets", []):
@@ -99,8 +146,11 @@ def fetch_current_odds(api_key: str, date_str: str) -> pd.DataFrame:
             home_med = float(np.median(ml_h))
             away_med = float(np.median(ml_a))
             p_home, p_away = vig_free_prob(home_med, away_med)
+            home_price = int(round(home_med))
+            away_price = int(round(away_med))
         else:
             p_home = p_away = np.nan
+            home_price = away_price = None
 
         ou_line = float(np.median(ou_lines)) if ou_lines else np.nan
 
@@ -109,6 +159,8 @@ def fetch_current_odds(api_key: str, date_str: str) -> pd.DataFrame:
             "api_away_team": away_team,
             "p_home_fair":   p_home,
             "p_away_fair":   p_away,
+            "home_price_raw": home_price,
+            "away_price_raw": away_price,
             "ou_line":       ou_line,
             "n_books":       len(ml_h),
         })
@@ -191,15 +243,19 @@ def pull_odds(engine, schema: str, date_str: str, pull_type: str,
 
         if pull_type == "morning":
             row = {
-                "game_id":         game_id,
-                "morning_p_home":  odds["p_home_fair"],
-                "morning_ou_line": odds["ou_line"],
+                "game_id":            game_id,
+                "morning_p_home":     odds["p_home_fair"],
+                "morning_ou_line":    odds["ou_line"],
+                "morning_home_price": odds.get("home_price_raw"),
+                "morning_away_price": odds.get("away_price_raw"),
             }
         else:  # closing
             row = {
-                "game_id":         game_id,
-                "closing_p_home":  odds["p_home_fair"],
-                "closing_ou_line": odds["ou_line"],
+                "game_id":            game_id,
+                "closing_p_home":     odds["p_home_fair"],
+                "closing_ou_line":    odds["ou_line"],
+                "closing_home_price": odds.get("home_price_raw"),
+                "closing_away_price": odds.get("away_price_raw"),
             }
         rows.append(row)
 
@@ -214,12 +270,23 @@ def pull_odds(engine, schema: str, date_str: str, pull_type: str,
     with engine.begin() as conn:
         df_out.to_sql("_mv_tmp", conn, schema=schema,
                       if_exists="replace", index=False, method="multi")
-        conn.execute(text(f"""
-            UPDATE {schema}.features_game AS t
-            SET {set_clause}
-            FROM {schema}._mv_tmp AS s
-            WHERE t.game_id = s.game_id
-        """))
+        if pull_type == "morning":
+            # Never overwrite morning lines once stored (pre-game snapshot is frozen).
+            conn.execute(text(f"""
+                UPDATE {schema}.features_game AS t
+                SET {set_clause}
+                FROM {schema}._mv_tmp AS s
+                WHERE t.game_id = s.game_id
+                  AND t.morning_p_home IS NULL
+            """))
+        else:
+            conn.execute(text(f"""
+                UPDATE {schema}.features_game AS t
+                SET {set_clause}
+                FROM {schema}._mv_tmp AS s
+                WHERE t.game_id = s.game_id
+                  AND t.closing_p_home IS NULL
+            """))
         conn.execute(text(f"DROP TABLE IF EXISTS {schema}._mv_tmp"))
 
     print(f"  {pull_type.capitalize()} odds stored for {len(rows)} games.")
