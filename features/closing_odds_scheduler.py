@@ -29,6 +29,8 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import create_engine, text
 import pytz
 
+from features.odds_team_match import match_game_to_odds_row
+
 ODDS_API_BASE  = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/"
 ODDS_API_SPORT = "baseball_mlb"
 PT             = pytz.timezone("America/Los_Angeles")
@@ -36,6 +38,9 @@ PT             = pytz.timezone("America/Los_Angeles")
 CLOSING_WINDOW_MINUTES = 75
 POLL_INTERVAL_SECONDS  = 900   # fallback retry / unknown first-pitch backoff
 MAX_RUNTIME_HOURS      = 8
+MAX_API_CALLS_PER_RUN  = 40    # hard cap (~80 credits); prevents runaway loops
+MAX_ZERO_PULL_STREAK   = 3     # consecutive fetches with no stored games → exit
+MATCH_FAIL_BACKOFF_SEC = 600   # sleep when API returns but no games match
 
 
 # ---------------------------------------------------------------------------
@@ -135,25 +140,6 @@ def fetch_all_odds(api_key: str) -> tuple[pd.DataFrame, int]:
         })
 
     return pd.DataFrame(records), cost
-
-
-# ---------------------------------------------------------------------------
-# Game matching
-# ---------------------------------------------------------------------------
-
-def match_game_to_odds(home_team: str, away_team: str,
-                       df_odds: pd.DataFrame) -> dict | None:
-    ht = home_team.lower().strip()
-    at = away_team.lower().strip()
-
-    for _, row in df_odds.iterrows():
-        kh = row["api_home_team"].lower().strip()
-        ka = row["api_away_team"].lower().strip()
-        if (set(ht.split()) & set(kh.split())) and \
-           (set(at.split()) & set(ka.split())):
-            return row.to_dict()
-
-    return None
 
 
 def closing_deadline(first_pitch_utc, closing_window_minutes: int):
@@ -353,8 +339,11 @@ def run_scheduler(
 
     games    = get_games_with_first_pitch(engine, schema, date_str)
     pulled   = set()
+    skipped  = set()  # games abandoned after repeated match failures
+    match_fails: dict[int, int] = {}
     api_calls = 0
     credits   = 0
+    zero_pull_streak = 0
     start_ts  = datetime.now(timezone.utc)
     max_end   = start_ts + timedelta(hours=MAX_RUNTIME_HOURS)
 
@@ -381,19 +370,24 @@ def run_scheduler(
             print(f"  Max runtime ({MAX_RUNTIME_HOURS}h) reached — exiting")
             break
 
-        if len(pulled) == len(games):
-            print(f"  [{now_pt_str}] All games processed — scheduler complete")
+        if len(pulled) + len(skipped) >= len(games):
+            print(f"  [{now_pt_str}] All games processed or skipped — scheduler complete")
             break
 
-        due = games_due_for_closing(games, pulled, now_utc, closing_window_minutes)
+        if api_calls >= MAX_API_CALLS_PER_RUN:
+            print(f"  PIPELINE_ALERT severity=critical job=closing_odds "
+                  f"message=Hit MAX_API_CALLS_PER_RUN ({MAX_API_CALLS_PER_RUN}) — exiting to protect quota")
+            break
+
+        due = games_due_for_closing(games, pulled | skipped, now_utc, closing_window_minutes)
         if not due:
             wait = seconds_until_next_closing_deadline(
-                games, pulled, now_utc, closing_window_minutes,
+                games, pulled | skipped, now_utc, closing_window_minutes,
             )
             if wait is None:
                 break
             nap = int(min(max(wait, 30), poll_interval * 4, (max_end - now_utc).total_seconds()))
-            remaining = len(games) - len(pulled)
+            remaining = len(games) - len(pulled) - len(skipped)
             print(f"  [{now_pt_str}] Waiting for next closing window — "
                   f"{remaining} games left, sleep {nap}s")
             time.sleep(nap)
@@ -403,26 +397,51 @@ def run_scheduler(
         df_odds, cost = fetch_all_odds(api_key)
         api_calls += 1
         credits += cost
+        stored_this_round = 0
 
         if df_odds.empty:
+            zero_pull_streak += 1
             err_sleep = min(max(poll_interval, 600), 3600)
-            print(f"    No odds returned — will retry in {err_sleep}s")
+            print(f"    No odds returned — will retry in {err_sleep}s "
+                  f"(zero-pull streak {zero_pull_streak}/{MAX_ZERO_PULL_STREAK})")
+            if zero_pull_streak >= MAX_ZERO_PULL_STREAK:
+                print("  PIPELINE_ALERT severity=critical job=closing_odds "
+                      "message=Odds API returned empty repeatedly — exiting")
+                break
             time.sleep(err_sleep)
             continue
 
         for game in due:
             game_id = int(game["game_id"])
-            odds = match_game_to_odds(game["home_team"], game["away_team"], df_odds)
+            odds = match_game_to_odds_row(game["home_team"], game["away_team"], df_odds)
             if odds is None:
-                print(f"    ✗ No odds match: {game['away_team']} @ {game['home_team']}")
+                match_fails[game_id] = match_fails.get(game_id, 0) + 1
+                nfail = match_fails[game_id]
+                print(f"    ✗ No odds match: {game['away_team']} @ {game['home_team']} "
+                      f"(attempt {nfail}/3)")
+                if nfail >= 3:
+                    skipped.add(game_id)
                 continue
 
             store_closing_odds(engine, schema, game_id, odds)
             pulled.add(game_id)
+            stored_this_round += 1
             print(f"    ✓ {game['away_team']} @ {game['home_team']}: "
                   f"p_home={odds.get('p_home_fair', 0):.3f} "
                   f"away={odds.get('away_price_raw')} home={odds.get('home_price_raw')} "
                   f"ou={odds.get('ou_line', '—')} n_books={odds.get('n_books', 0)}")
+
+        if stored_this_round == 0:
+            zero_pull_streak += 1
+            print(f"    No games stored this fetch — backoff {MATCH_FAIL_BACKOFF_SEC}s "
+                  f"(zero-pull streak {zero_pull_streak}/{MAX_ZERO_PULL_STREAK})")
+            if zero_pull_streak >= MAX_ZERO_PULL_STREAK:
+                print("  PIPELINE_ALERT severity=critical job=closing_odds "
+                      "message=Team match failed for all due games — exiting to protect quota")
+                break
+            time.sleep(MATCH_FAIL_BACKOFF_SEC)
+        else:
+            zero_pull_streak = 0
 
     if pulled:
         rerun_inference(date_str, ml_model_path, total_model_path)
