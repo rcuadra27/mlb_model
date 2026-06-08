@@ -1,6 +1,6 @@
 # MLB Game Prediction System
 
-A production ML system that predicts MLB game outcomes using gradient-boosted models and market calibration, deployed on Google Cloud Platform. The public site is **[thehotcorner.com](https://thehotcorner.com)** — a React dashboard with live scores, model vs market edges, player props, model accuracy tracking, and an **AI assistant** that answers questions using the same data the model uses.
+A production ML system that predicts MLB game outcomes using gradient-boosted models and market calibration, deployed on Google Cloud Platform. The public site is **[the-hot-corner.com](https://the-hot-corner.com)** — a React dashboard with live scores, model vs market edges, player props, model accuracy tracking, and an **AI assistant** that answers questions using the same data the model uses.
 
 ## Architecture
 
