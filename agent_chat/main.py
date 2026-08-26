@@ -26,87 +26,59 @@ Environment:
 
 from __future__ import annotations
 
-import datetime as dt
 import json
-import os
 import re
 import time
-import unicodedata
-import urllib.error
-import urllib.request
 from collections import defaultdict, deque
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import functions_framework
-from anthropic import Anthropic
-from google.cloud import bigquery
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-MODEL = os.environ.get("MODEL", "claude-haiku-4-5")
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
-DAILY_MSG_LIMIT = int(os.environ.get("DAILY_MSG_LIMIT", "40"))
-MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "4"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "500"))
-BQ_TABLE = "mlb-model-491223.mlb_model_logs.daily_games"
-PREDICTION_CACHE_TTL_SECONDS = int(os.environ.get("PREDICTION_CACHE_TTL_SECONDS", "300"))
-
-# Min |predicted total − market O/U line| to count as an O/U bet in tool aggregates (aligned with grading).
-OU_PRED_LINE_GAP = 0.5
-V10_LAUNCH_DATE = "2026-05-28"
+from common import (
+    BATTER_TOP_PROP_MAP,
+    PITCHER_TOP_PROP_MAP,
+    TEAM_ABBR_BY_NAME,
+    _cache_get,
+    _cache_set,
+    _latest_snapshot_cte,
+    _name_match_score,
+    _normalize_name_for_match,
+    _normalize_prop_type,
+    _pct,
+    _row_to_dict,
+    _safe_float,
+    _stored_ou_is_pass_like,
+)
+from config import (
+    ALLOWED_ORIGIN,
+    DAILY_MSG_LIMIT,
+    MAX_OUTPUT_TOKENS,
+    MAX_TOOL_ROUNDS,
+    MODEL,
+    OU_PRED_LINE_GAP,
+    V10_LAUNCH_DATE,
+    _BQ,
+    _GAMES_CACHE,
+    _INPUT_USD_PER_MTOK,
+    _OUTPUT_USD_PER_MTOK,
+    _PLAYER_PROP_CACHE,
+    _PROPS_CACHE,
+    _SLATE_BATTERS_CACHE,
+    _TOP_PROPS_CACHE,
+    _anthropic,
+    _pg,
+    _today_pacific_iso,
+)
+from mlb_live import (
+    _enrich_game_with_outcome,
+    _fetch_mlb_game_feed,
+    _fetch_mlb_schedule_map,
+    _resolve_game_outcome,
+)
 
 _RATE: dict[str, deque[float]] = defaultdict(deque)
 _RATE_WINDOW_S = 24 * 3600
-
-# Haiku list pricing (USD per 1M tokens) — used for Cloud Logging spend metrics / alerts.
-_INPUT_USD_PER_MTOK = float(os.environ.get("AGENT_CHAT_INPUT_USD_PER_MTOK", "1"))
-_OUTPUT_USD_PER_MTOK = float(os.environ.get("AGENT_CHAT_OUTPUT_USD_PER_MTOK", "5"))
-
-# Align with the React dashboard: schedule dates and "today" are US Pacific (MLB local game days).
-_TZ_PT = ZoneInfo("America/Los_Angeles")
-
-
-def _today_pacific_iso() -> str:
-    return dt.datetime.now(_TZ_PT).date().isoformat()
-
-_BQ = bigquery.Client()
-_GAMES_CACHE: dict[str, tuple[float, dict]] = {}
-_PROPS_CACHE: dict[int, tuple[float, dict]] = {}
-_TOP_PROPS_CACHE: dict[str, tuple[float, dict]] = {}
-_SLATE_BATTERS_CACHE: dict[str, tuple[float, list]] = {}
-_PLAYER_PROP_CACHE: dict[str, tuple[float, dict]] = {}
-_FEED_CACHE: dict[str, tuple[float, dict]] = {}
-_SCHEDULE_CACHE: dict[str, tuple[float, dict]] = {}
-MLB_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
-MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}&gameTypes=R&hydrate=linescore"
-MLB_FEED_CACHE_TTL_SECONDS = 60
-MLB_SCHEDULE_CACHE_TTL_SECONDS = 60
-_ANTHROPIC: Anthropic | None = None
-_PG_ENGINE = None
-
-
-def _anthropic() -> Anthropic:
-    global _ANTHROPIC
-    if _ANTHROPIC is None:
-        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        if not key:
-            raise RuntimeError("ANTHROPIC_API_KEY not set")
-        _ANTHROPIC = Anthropic(api_key=key)
-    return _ANTHROPIC
-
-
-def _pg():
-    global _PG_ENGINE
-    if _PG_ENGINE is None:
-        dsn = os.environ.get("PG_DSN", "").strip()
-        if not dsn:
-            raise RuntimeError("PG_DSN not set")
-        _PG_ENGINE = create_engine(dsn, pool_pre_ping=True, pool_size=1, max_overflow=0)
-    return _PG_ENGINE
 
 
 # ---------------------------------------------------------------------------
@@ -131,18 +103,15 @@ def _rate_limit_ok(ip: str) -> bool:
     return True
 
 
-def _estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
-    return (input_tokens / 1_000_000.0) * _INPUT_USD_PER_MTOK + (
-        output_tokens / 1_000_000.0
-    ) * _OUTPUT_USD_PER_MTOK
-
-
 def log_agent_usage(usage: dict | None) -> None:
     """Structured JSON for Cloud Logging spend metrics (see scripts/setup_agent_chat_alerts.sh)."""
     u = usage or {}
     inp = int(u.get("input_tokens") or 0)
     out = int(u.get("output_tokens") or 0)
-    cost = round(_estimate_cost_usd(inp, out), 6)
+    cost = round(
+        (inp / 1_000_000.0) * _INPUT_USD_PER_MTOK + (out / 1_000_000.0) * _OUTPUT_USD_PER_MTOK,
+        6,
+    )
     print(
         json.dumps({
             "event": "AGENT_CHAT_USAGE",
@@ -156,139 +125,8 @@ def log_agent_usage(usage: dict | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# BigQuery helpers
+# Moneyline / odds helpers
 # ---------------------------------------------------------------------------
-
-def _stored_ou_is_pass_like(raw: object) -> bool:
-    if raw is None:
-        return False
-    s = str(raw).strip().upper()
-    if not s:
-        return False
-    return s in ("PUSH", "PASS")
-
-
-def _row_to_dict(row) -> dict:
-    out = dict(row)
-    for k, v in list(out.items()):
-        if hasattr(v, "isoformat"):
-            out[k] = v.isoformat()
-    return out
-
-
-def _safe_float(v):
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _cache_get(cache: dict, key):
-    item = cache.get(key)
-    if not item:
-        return None
-    expires_at, payload = item
-    if expires_at <= time.time():
-        cache.pop(key, None)
-        return None
-    return payload
-
-
-def _cache_set(cache: dict, key, payload):
-    cache[key] = (time.time() + PREDICTION_CACHE_TTL_SECONDS, payload)
-    return payload
-
-
-def _latest_snapshot_cte(where: str) -> str:
-    return f"""
-        WITH latest AS (
-            SELECT *,
-                ROW_NUMBER() OVER (PARTITION BY game_id ORDER BY as_of_ts DESC) AS rn
-            FROM `{BQ_TABLE}`
-            WHERE {where}
-        )
-        SELECT * FROM latest WHERE rn = 1
-    """
-
-
-TEAM_ABBR_BY_NAME = {
-    "Arizona Diamondbacks": "ARI",
-    "Atlanta Braves": "ATL",
-    "Baltimore Orioles": "BAL",
-    "Boston Red Sox": "BOS",
-    "Chicago Cubs": "CHC",
-    "Chicago White Sox": "CWS",
-    "Cincinnati Reds": "CIN",
-    "Cleveland Guardians": "CLE",
-    "Colorado Rockies": "COL",
-    "Detroit Tigers": "DET",
-    "Houston Astros": "HOU",
-    "Kansas City Royals": "KC",
-    "Los Angeles Angels": "LAA",
-    "Los Angeles Dodgers": "LAD",
-    "Miami Marlins": "MIA",
-    "Milwaukee Brewers": "MIL",
-    "Minnesota Twins": "MIN",
-    "New York Mets": "NYM",
-    "New York Yankees": "NYY",
-    "Oakland Athletics": "OAK",
-    "Athletics": "OAK",
-    "Philadelphia Phillies": "PHI",
-    "Pittsburgh Pirates": "PIT",
-    "San Diego Padres": "SD",
-    "San Francisco Giants": "SF",
-    "Seattle Mariners": "SEA",
-    "St. Louis Cardinals": "STL",
-    "Tampa Bay Rays": "TB",
-    "Texas Rangers": "TEX",
-    "Toronto Blue Jays": "TOR",
-    "Washington Nationals": "WSH",
-}
-
-
-BatterPropSpec = dict[str, str]
-BATTER_TOP_PROP_MAP: dict[str, BatterPropSpec] = {
-    "hit": {"column": "p_hit", "label": "1+ hit probability"},
-    "hits": {"column": "p_hit", "label": "1+ hit probability"},
-    "1_hit": {"column": "p_hit", "label": "1+ hit probability"},
-    "1plus_hit": {"column": "p_hit", "label": "1+ hit probability"},
-    "2plus_hits": {"column": "p_2plus_hits", "label": "2+ hits probability"},
-    "2_hits": {"column": "p_2plus_hits", "label": "2+ hits probability"},
-    "two_hits": {"column": "p_2plus_hits", "label": "2+ hits probability"},
-    "hr": {"column": "p_hr", "label": "home run probability"},
-    "homer": {"column": "p_hr", "label": "home run probability"},
-    "home_run": {"column": "p_hr", "label": "home run probability"},
-    "k": {"column": "p_k", "label": "batter strikeout probability"},
-    "batter_k": {"column": "p_k", "label": "batter strikeout probability"},
-    "strikeout": {"column": "p_k", "label": "batter strikeout probability"},
-    "walk": {"column": "p_walk", "label": "walk probability"},
-    "bb": {"column": "p_walk", "label": "walk probability"},
-    "2plus_bases": {"column": "p_2plus_bases", "label": "2+ total bases probability"},
-    "2_tb": {"column": "p_2plus_bases", "label": "2+ total bases probability"},
-    "tb": {"column": "p_2plus_bases", "label": "2+ total bases probability"},
-    "total_bases": {"column": "p_2plus_bases", "label": "2+ total bases probability"},
-}
-
-PITCHER_TOP_PROP_MAP: dict[str, BatterPropSpec] = {
-    "expected_k": {"column": "lambda_k", "label": "expected strikeouts"},
-    "pitcher_k": {"column": "lambda_k", "label": "expected strikeouts"},
-    "lambda_k": {"column": "lambda_k", "label": "expected strikeouts"},
-    "k_over_3_5": {"column": "p_over_3_5", "label": "pitcher over 3.5 K probability"},
-    "k_over_4_5": {"column": "p_over_4_5", "label": "pitcher over 4.5 K probability"},
-    "k_over_5_5": {"column": "p_over_5_5", "label": "pitcher over 5.5 K probability"},
-    "k_over_6_5": {"column": "p_over_6_5", "label": "pitcher over 6.5 K probability"},
-    "k_over_7_5": {"column": "p_over_7_5", "label": "pitcher over 7.5 K probability"},
-    "k_over_8_5": {"column": "p_over_8_5", "label": "pitcher over 8.5 K probability"},
-    "k_over_9_5": {"column": "p_over_9_5", "label": "pitcher over 9.5 K probability"},
-}
-
-
-def _normalize_prop_type(prop_type: str | None) -> str:
-    raw = (prop_type or "hit").strip().lower()
-    return raw.replace("+", "plus").replace(" ", "_").replace("-", "_").replace(".", "_")
-
 
 def _american_to_prob(odds) -> float | None:
     try:
@@ -323,24 +161,14 @@ def _is_sane_ml_price(price) -> bool:
     return p != 0 and abs(p) <= 500
 
 
-def _is_sane_market_prob(prob) -> bool:
-    if prob is None:
-        return False
-    try:
-        p = float(prob)
-    except (TypeError, ValueError):
-        return False
-    return 0.08 <= p <= 0.92
-
-
 def _is_sane_market_pct(pct) -> bool:
-    if pct is None:
-        return False
-    try:
-        p = float(pct)
-    except (TypeError, ValueError):
-        return False
-    return 8.0 <= p <= 92.0
+    p = _safe_float(pct)
+    return p is not None and 8.0 <= p <= 92.0
+
+
+def _is_sane_market_prob(prob) -> bool:
+    p = _safe_float(prob)
+    return p is not None and _is_sane_market_pct(p * 100.0)
 
 
 def _fetch_pregame_odds_from_pg(date_str: str | None) -> dict[int, dict]:
@@ -580,10 +408,6 @@ def tool_get_game_detail(game_id: int) -> dict:
     if not rows:
         return {"error": "game_not_found", "game_id": game_id}
     r = _row_to_dict(rows[0])
-
-    def _pct(x):
-        return round(float(x) * 100, 1) if x is not None else None
-
     row = {
         "game_id": r.get("game_id"),
         "away_team": r.get("away_team"),
@@ -1857,15 +1681,6 @@ def tool_get_player_prop(
         }
 
 
-def _pct(val) -> float | None:
-    if val is None:
-        return None
-    try:
-        return round(float(val) * 100, 1)
-    except (TypeError, ValueError):
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Top Edges (daily_edges table — same source as dashboard Top Edges tab)
 # ---------------------------------------------------------------------------
@@ -2302,76 +2117,6 @@ def _fetch_games_for_edges(date_str: str, game_ids: list[int]) -> dict[int, dict
     return out
 
 
-def _resolve_game_outcome(
-    game_row: dict | None,
-    feed: dict | None = None,
-    schedule_row: dict | None = None,
-) -> dict:
-    """Merge BQ + MLB schedule + feed into one outcome (dashboard parity)."""
-    away_team = (game_row or {}).get("away_team") or "Away"
-    home_team = (game_row or {}).get("home_team") or "Home"
-
-    if schedule_row:
-        status = {
-            "game_status": schedule_row.get("game_status"),
-            "is_final": schedule_row.get("is_final"),
-            "is_live": schedule_row.get("is_live"),
-            "status_detail": schedule_row.get("status_detail"),
-        }
-    elif feed and not feed.get("error"):
-        status = _parse_game_status_from_feed(feed)
-    else:
-        status = _parse_bq_game_status(game_row)
-
-    bq_status = _parse_bq_game_status(game_row)
-    if schedule_row and schedule_row.get("is_final"):
-        status = {
-            "game_status": "final",
-            "is_final": True,
-            "is_live": False,
-            "status_detail": schedule_row.get("status_detail") or "Final",
-        }
-    elif bq_status.get("is_final") and not status.get("is_final"):
-        status = bq_status
-
-    sched_away = (schedule_row or {}).get("away_runs")
-    sched_home = (schedule_row or {}).get("home_runs")
-    ls = ((feed or {}).get("liveData") or {}).get("linescore") or {}
-    teams = ls.get("teams") or {}
-    feed_away = teams.get("away", {}).get("runs")
-    feed_home = teams.get("home", {}).get("runs")
-    bq_away = (game_row or {}).get("away_runs")
-    bq_home = (game_row or {}).get("home_runs")
-
-    if status.get("is_final"):
-        away_runs = _pick_finished_game_runs(sched_away, _pick_finished_game_runs(feed_away, bq_away))
-        home_runs = _pick_finished_game_runs(sched_home, _pick_finished_game_runs(feed_home, bq_home))
-    else:
-        away_runs = _first_int_runs(sched_away, feed_away, bq_away)
-        home_runs = _first_int_runs(sched_home, feed_home, bq_home)
-
-    score_line = None
-    if away_runs is not None and home_runs is not None:
-        score_line = f"{away_team} {away_runs}, {home_team} {home_runs}"
-
-    winner = None
-    if status.get("is_final") and away_runs is not None and home_runs is not None:
-        if away_runs > home_runs:
-            winner = away_team
-        elif home_runs > away_runs:
-            winner = home_team
-
-    return {
-        **status,
-        "away_team": away_team,
-        "home_team": home_team,
-        "away_runs": away_runs,
-        "home_runs": home_runs,
-        "score_line": score_line,
-        "winner": winner,
-    }
-
-
 def _player_stats_cache_key(game_id: int, player_id: int | None, player_name: str | None) -> tuple:
     return (int(game_id), int(player_id) if player_id is not None else None, (player_name or "").strip().lower())
 
@@ -2669,313 +2414,6 @@ def tool_get_top_edges(date: str | None = None, grade_results: bool = True) -> d
         return {"error": "top_edges_query_failed", "message": str(e)[:300], "date": date}
 
 
-# ---------------------------------------------------------------------------
-# Live / final box score (MLB Stats API — same source as Players tab game logs)
-# ---------------------------------------------------------------------------
-
-def _feed_cache_get(key: str):
-    item = _FEED_CACHE.get(key)
-    if not item:
-        return None
-    expires_at, payload = item
-    if expires_at <= time.time():
-        _FEED_CACHE.pop(key, None)
-        return None
-    return payload
-
-
-def _feed_cache_set(key: str, payload: dict) -> dict:
-    _FEED_CACHE[key] = (time.time() + MLB_FEED_CACHE_TTL_SECONDS, payload)
-    return payload
-
-
-def _fetch_mlb_game_feed(game_id: int) -> dict:
-    key = str(int(game_id))
-    cached = _feed_cache_get(key)
-    if cached is not None:
-        return cached
-    url = MLB_FEED_URL.format(game_id=int(game_id))
-    req = urllib.request.Request(url, headers={"User-Agent": "mlb-agent-chat/1"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as exc:
-        return {"error": "mlb_feed_http_error", "status": exc.code, "game_id": game_id}
-    except Exception as exc:
-        return {"error": "mlb_feed_failed", "message": str(exc)[:200], "game_id": game_id}
-    return _feed_cache_set(key, data)
-
-
-def _is_live_status(status: str | None) -> bool:
-    s = (status or "").lower()
-    if "final" in s or "game over" in s or "completed early" in s:
-        return False
-    return "progress" in s or "warmup" in s or "delayed" in s or s == "live"
-
-
-def _is_mlb_game_finished(detailed: str | None, abstract: str | None, coded: str | None) -> bool:
-    abs_l = (abstract or "").strip().lower()
-    if abs_l == "final":
-        return True
-    code = (coded or "").strip().upper()
-    if code == "F":
-        return True
-    d = (detailed or "").strip().lower()
-    return d in ("final", "game over") or "completed early" in d or "game over" in d
-
-
-def _is_postponed_or_cancelled(detailed: str | None, abstract: str | None) -> bool:
-    abs_l = (abstract or "").strip().lower()
-    if "postponed" in abs_l:
-        return True
-    d = (detailed or "").strip().lower()
-    return any(x in d for x in ("postponed", "cancelled", "canceled"))
-
-
-def _parse_game_status_from_feed(feed: dict) -> dict:
-    status = (feed.get("gameData") or {}).get("status") or {}
-    abstract = (status.get("abstractGameState") or "").strip()
-    detailed = (status.get("detailedState") or "").strip()
-    coded = (status.get("codedGameState") or "").strip()
-    ls = (feed.get("liveData") or {}).get("linescore") or {}
-    current_inning = ls.get("currentInning")
-    inning_state = (ls.get("inningState") or "").strip()
-
-    if _is_postponed_or_cancelled(detailed, abstract):
-        return {
-            "game_status": "postponed",
-            "is_final": False,
-            "is_live": False,
-            "status_detail": detailed or abstract or "Postponed",
-        }
-
-    is_final = _is_mlb_game_finished(detailed, abstract, coded)
-    is_live = (not is_final) and _is_live_status(detailed or abstract)
-
-    if is_final:
-        return {
-            "game_status": "final",
-            "is_final": True,
-            "is_live": False,
-            "status_detail": detailed or abstract or "Final",
-        }
-
-    if is_live:
-        detail = detailed or abstract or "In progress"
-        if current_inning and not detailed:
-            half = ""
-            if inning_state.lower().startswith("top"):
-                half = "Top"
-            elif inning_state.lower().startswith("bot"):
-                half = "Bottom"
-            detail = f"{half} {current_inning}".strip() if half else f"Inning {current_inning}"
-        return {
-            "game_status": "in_progress",
-            "is_final": False,
-            "is_live": True,
-            "status_detail": detail,
-            "current_inning": current_inning,
-            "inning_state": inning_state or None,
-        }
-
-    abs_l = abstract.lower()
-    if abs_l in ("preview", "scheduled", "pre-game") or coded in ("P", "S"):
-        return {
-            "game_status": "scheduled",
-            "is_final": False,
-            "is_live": False,
-            "status_detail": detailed or abstract or "Scheduled",
-        }
-
-    return {
-        "game_status": "scheduled",
-        "is_final": False,
-        "is_live": False,
-        "status_detail": detailed or abstract or "Not started",
-    }
-
-
-def _schedule_cache_get(key: str):
-    item = _SCHEDULE_CACHE.get(key)
-    if not item:
-        return None
-    expires_at, payload = item
-    if expires_at <= time.time():
-        _SCHEDULE_CACHE.pop(key, None)
-        return None
-    return payload
-
-
-def _schedule_cache_set(key: str, payload: dict) -> dict:
-    _SCHEDULE_CACHE[key] = (time.time() + MLB_SCHEDULE_CACHE_TTL_SECONDS, payload)
-    return payload
-
-
-def _fetch_mlb_schedule_map(date_str: str) -> dict[int, dict]:
-    """MLB schedule + linescore — same hydrate the dashboard useLiveScores uses."""
-    cached = _schedule_cache_get(date_str)
-    if cached is not None:
-        return cached
-    url = MLB_SCHEDULE_URL.format(date=date_str)
-    req = urllib.request.Request(url, headers={"User-Agent": "mlb-agent-chat/1"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
-        return _schedule_cache_set(date_str, {})
-
-    out: dict[int, dict] = {}
-    for day in data.get("dates") or []:
-        for g in day.get("games") or []:
-            pk = g.get("gamePk")
-            if pk is not None:
-                out[int(pk)] = _parse_schedule_entry(g)
-    return _schedule_cache_set(date_str, out)
-
-
-def _parse_schedule_entry(g: dict) -> dict:
-    status_obj = g.get("status") or {}
-    detailed = (status_obj.get("detailedState") or "").strip()
-    abstract = (status_obj.get("abstractGameState") or "").strip()
-    coded = (status_obj.get("codedGameState") or "").strip()
-    ls = g.get("linescore") or {}
-    teams = ls.get("teams") or {}
-    away_runs = teams.get("away", {}).get("runs")
-    home_runs = teams.get("home", {}).get("runs")
-
-    if _is_postponed_or_cancelled(detailed, abstract):
-        game_status = "postponed"
-        is_final = False
-        is_live = False
-    elif _is_mlb_game_finished(detailed, abstract, coded):
-        game_status = "final"
-        is_final = True
-        is_live = False
-    elif _is_live_status(detailed or abstract):
-        game_status = "in_progress"
-        is_final = False
-        is_live = True
-    else:
-        game_status = "scheduled"
-        is_final = False
-        is_live = False
-
-    return {
-        "game_id": int(g.get("gamePk")),
-        "game_status": game_status,
-        "is_final": is_final,
-        "is_live": is_live,
-        "status_detail": detailed or abstract or game_status.replace("_", " ").title(),
-        "away_runs": int(away_runs) if away_runs is not None else None,
-        "home_runs": int(home_runs) if home_runs is not None else None,
-    }
-
-
-def _parse_bq_game_status(game_row: dict | None) -> dict:
-    raw = ((game_row or {}).get("status") or "").strip()
-    s = raw.lower()
-    if _is_postponed_or_cancelled(raw, None):
-        return {
-            "game_status": "postponed",
-            "is_final": False,
-            "is_live": False,
-            "status_detail": raw or "Postponed",
-        }
-    if "final" in s or s == "game over" or "completed" in s:
-        return {
-            "game_status": "final",
-            "is_final": True,
-            "is_live": False,
-            "status_detail": raw or "Final",
-        }
-    if _is_live_status(raw):
-        return {
-            "game_status": "in_progress",
-            "is_final": False,
-            "is_live": True,
-            "status_detail": raw or "In progress",
-        }
-    return {
-        "game_status": "scheduled",
-        "is_final": False,
-        "is_live": False,
-        "status_detail": raw or "Scheduled",
-    }
-
-
-def _first_int_runs(*sources) -> int | None:
-    for src in sources:
-        if src is None:
-            continue
-        try:
-            return int(src)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _pick_finished_game_runs(mlb_runs, db_runs) -> int | None:
-    """Prefer MLB linescore for finals; fall back to BigQuery snapshot."""
-    return _first_int_runs(mlb_runs, db_runs)
-
-
-def _enrich_game_with_outcome(game: dict, schedule_map: dict[int, dict]) -> dict:
-    gid = game.get("game_id")
-    schedule_row = schedule_map.get(int(gid)) if gid is not None else None
-    outcome = _resolve_game_outcome(game, schedule_row=schedule_row)
-    enriched = dict(game)
-    enriched.update({
-        "game_status": outcome.get("game_status"),
-        "is_final": outcome.get("is_final"),
-        "is_live": outcome.get("is_live"),
-        "status_detail": outcome.get("status_detail"),
-        "away_runs": outcome.get("away_runs"),
-        "home_runs": outcome.get("home_runs"),
-        "score_line": outcome.get("score_line"),
-        "winner": outcome.get("winner"),
-    })
-    return enriched
-
-
-def _normalize_name_for_match(name: str) -> str:
-    """Lowercase, strip accents, collapse whitespace — for player name matching."""
-    if not name:
-        return ""
-    s = unicodedata.normalize("NFKD", str(name).strip().lower())
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    return " ".join(s.split())
-
-
-def _name_matches(query: str, full_name: str) -> bool:
-    return _name_match_score(query, full_name) >= 85
-
-
-def _name_match_score(query: str, full_name: str) -> int:
-    q = _normalize_name_for_match(query)
-    n = _normalize_name_for_match(full_name)
-    if not q or not n:
-        return 0
-    if q == n:
-        return 100
-    parts = n.split()
-    last = parts[-1] if parts else ""
-    q_tokens = q.split()
-    if len(q_tokens) > 1:
-        if all(tok in parts for tok in q_tokens):
-            return 98
-        if all(tok in n for tok in q_tokens):
-            return 92
-    if q == last:
-        return 95
-    if q in n:
-        return 85
-    if q in last:
-        return 75
-    if len(q_tokens) == 1 and q_tokens[0] == last:
-        return 95
-    return 0
-
-
 def _format_batting_line(bat: dict) -> str | None:
     summary = bat.get("summary")
     if summary is not None and str(summary).strip():
@@ -3052,7 +2490,7 @@ def _extract_batter_stats(team_box: dict, player_name: str, player_id: int | Non
             if not p:
                 continue
             name = (p.get("person") or {}).get("fullName") or ""
-            if _name_matches(player_name, name):
+            if _name_match_score(player_name, name) >= 85:
                 target = p
                 break
     if target is None:
@@ -3115,7 +2553,7 @@ def _extract_pitcher_stats(team_box: dict, player_name: str, player_id: int | No
             if not p:
                 continue
             name = (p.get("person") or {}).get("fullName") or ""
-            if _name_matches(player_name, name):
+            if _name_match_score(player_name, name) >= 85:
                 target = p
                 break
     if target is None:
@@ -4069,6 +3507,20 @@ TOOL_FUNCS = {
     "get_top_edges":              lambda a: tool_get_top_edges(a.get("date"), a.get("grade_results", True)),
 }
 
+_DATE_DEFAULT_TOOLS = {
+    "get_game_predictions",
+    "get_top_props",
+    "get_player_prop",
+    "get_player_game_result",
+    "get_team_moneyline",
+    "get_team_game_result",
+    "get_top_edges",
+    "get_standings",
+    "get_trends",
+    "get_transactions",
+    "get_model_performance",
+}
+
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -4304,54 +3756,24 @@ def _build_context_preamble(context: dict | None) -> str | None:
 def _invoke_tool(name: str, args: dict | None, context: dict | None) -> dict:
     context = context or {}
     args = dict(args or {})
-
-    if name == "get_game_predictions":
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
-        result = tool_get_game_predictions(args.get("date"))
-        slate = context.get("date")
-        if slate and not result.get("games") and args.get("date") != slate:
-            result = tool_get_game_predictions(slate)
-        return result
-
-    if name == "get_top_props":
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
-        return tool_get_top_props(args.get("prop_type"), args.get("date"), args.get("limit", 10))
-
-    if name == "get_player_prop":
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
-        return tool_get_player_prop(args.get("player_name"), args.get("prop_type"), args.get("date"))
-
-    if name == "get_player_game_result":
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
-        return tool_get_player_game_result(args.get("player_name"), args.get("date"))
-
-    if name == "get_team_moneyline":
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
-        return tool_get_team_moneyline(args.get("team"), args.get("date"))
-
-    if name == "get_team_game_result":
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
-        return tool_get_team_game_result(args.get("team"), args.get("date"))
-
-    if name == "get_top_edges":
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
-        return tool_get_top_edges(args.get("date"), args.get("grade_results", True))
-
-    if name in ("get_standings", "get_trends", "get_transactions", "get_model_performance"):
-        if not args.get("date"):
-            args["date"] = context.get("date") or _today_pacific_iso()
+    if name in _DATE_DEFAULT_TOOLS and not args.get("date"):
+        args["date"] = context.get("date") or _today_pacific_iso()
 
     fn = TOOL_FUNCS.get(name)
     if fn is None:
         return {"error": "unknown_tool", "name": name}
-    return fn(args)
+
+    result = fn(args)
+    slate = context.get("date")
+    if (
+        name == "get_game_predictions"
+        and slate
+        and not result.get("games")
+        and args.get("date") != slate
+    ):
+        args["date"] = slate
+        result = fn(args)
+    return result
 
 
 def _text_from_response(resp) -> str:
