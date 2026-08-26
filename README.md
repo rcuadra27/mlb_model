@@ -90,7 +90,6 @@ mlb_model/
 ├── inference/                  # inference_v10, inference_v10_total, inference_props_v1
 ├── models/                     # Training scripts (v10, props, pitcher extras)
 ├── scripts/                    # Ops: key rotation, quota alerts, image pinning, scaling
-├── calibration/
 ├── artifacts/                  # .joblib models (gitignored; COPY into Docker build)
 ├── export_to_bigquery.py
 ├── run_daily.sh                # Pipeline entrypoint for Cloud Run jobs

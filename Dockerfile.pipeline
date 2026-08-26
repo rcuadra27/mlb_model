@@ -15,7 +15,6 @@ COPY export_to_bigquery.py .
 COPY ingest/ ingest/
 COPY features/ features/
 COPY inference/ inference/
-COPY calibration/ calibration/
 COPY models/ models/
 ENV PYTHONPATH=/app
 COPY artifacts/runs_model_v9.joblib /app/artifacts/runs_model_v9.joblib

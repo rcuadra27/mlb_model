@@ -33,9 +33,6 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 from scipy.stats import skellam, poisson
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from calibration.calibration import BetaCalibrator, PlattCalibrator
 
 # ---------------------------------------------------------------------------
 # Constants — must match training script exactly
